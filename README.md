@@ -201,6 +201,6 @@ Contributions are welcome! Feel free to open issues or PRs for:
 ---
 
 ## 📄 License
-[MIT License](https://github.com/jwm1rr0rb10/libraries/blob/main/backend/golang/LICENSE) – © Raman Zaitsau [@jwm1rrr0rb10](https://github.com/jwm1rr0rb10)
+[MIT License](https://github.com/jwm1rr0rb10/go-logging/blob/main/LICENSE) – © Raman Zaitsau [@jwm1rrr0rb10](https://github.com/jwm1rr0rb10)
 
 Made with ❤️ for Go teams who want clean, observable, and delightful logs.
