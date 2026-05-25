@@ -85,7 +85,7 @@ func Middleware(next http.Handler) http.Handler {
 		// Call next handler
 		next.ServeHTTP(rec, r.WithContext(ctx))
 
-		// Response logging
+		// Response logging.
 		duration := time.Since(start)
 		logAttrs := []any{
 			slog.String(requestIDLogKey, reqID),
@@ -94,7 +94,7 @@ func Middleware(next http.Handler) http.Handler {
 			slog.Int("bytes", rec.written),
 		}
 
-		// Choose log level based on status
+		// Choose log level based on status.
 		switch {
 		case rec.status >= 500:
 			mLogger.Error("request completed", logAttrs...)
