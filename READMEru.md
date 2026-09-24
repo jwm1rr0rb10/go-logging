@@ -1,206 +1,196 @@
-# logging
+# go-logging
 
-**Легковесная, готовая к использованию в производственной среде, контекстно-ориентированная обертка над Go-библиотекой `log/slog` со встроенной возможностью мониторинга, логирования запросов/ответов и превосходным удобством для разработчиков.**
+Тонкая обёртка над стандартным `log/slog` с поддержкой контекста, HTTP-middleware
+и gRPC-интерцепторами: request ID, корреляция с трейсами, итоговая запись по
+каждому запросу, сэмплирование и логирование паник.
 
-Эта библиотека предоставляет чистое, продуманное и легко настраиваемое решение для логирования, которое бесперебойно работает с OpenTelemetry, HTTP-серверами и gRPC-сервисами. Она устраняет рутинную работу, предоставляя структурированные, отслеживаемые и красивые логи «из коробки».
+Все типы — алиасы типов `log/slog`, поэтому `*logging.Logger` — это `*slog.Logger`,
+и он работает со всей экосистемой slog.
 
----
-
-## ✨ Features
-
-- **«Бесшовная» обертка для `slog`** — полная совместимость со стандартным пакетом `log/slog`
-- **Контекстно-зависимое логирование** — логгеры с областью видимости запроса (request-scoped) через `L(ctx)` и `ContextWithAttrs`
-- **Конфигурация на основе переменных окружения** — автоматическое чтение `LOG_LEVEL` или `SLOG_LEVEL`
-- **Режим разработчика (DevMode)** — красивый цветной текстовый вывод + автоматический уровень отладки для локальной разработки
-- **Полнофункциональное middleware для HTTP-запросов/ответов**:
-    - Автоматическая генерация и сквозная передача `X-Request-ID`
-    - Логирование метода, эндпоинта, удаленного адреса, ID трассировки/спана
-    - Фиксация кода состояния, времени выполнения и объема записанных данных
-    - Интеллектуальный выбор уровня логирования: `Error` для 5xx, `Warn` для 4xx, `Info` в остальных случаях
-- **Унарный интерцептор для gRPC** с корреляцией трассировок и спанов
-- **Расширенный набор вспомогательных функций для атрибутов** (`ErrAttr`, `TimeAttr`, `UInt32Attr` и др.)
-- **Функциональные опции** для лаконичной настройки
-- **Поддержка пользовательских писателей (writers)** — файлы, буферы, составные писатели (multi-writers) и т. д.
-- **Отсутствие внешних зависимостей**, за исключением `go.opentelemetry.io/otel` (который уже используется в большинстве современных бэкендов)
-- **Полностью протестировано** и готово к использованию в продакшене
-
----
-
-## 📦 Installation
+## Установка
 
 ```bash
-go get -u github.com/jwm1rr0rb10/go-logging
+go get github.com/jwm1rr0rb10/go-logging
 ```
 
----
+Нужен Go 1.21+ (точный минимум определяется зависимостями gRPC и OpenTelemetry).
 
-## 🚀 Quick Start
+## Быстрый старт
 
 ```go
 package main
 
 import (
-	"context"
 	"net/http"
-	"os"
 
-	"github.com/jwm1rr0rb10/go-logging"
+	logging "github.com/jwm1rr0rb10/go-logging"
 )
 
 func main() {
-	// Create logger (reads LOG_LEVEL automatically)
-	logger := logging.NewLogger(
-		logging.WithDevMode(true), // beautiful text output for local dev
-	)
+	logger := logging.NewLogger() // JSON в stdout, уровень из LOG_LEVEL, становится slog default
 
-	// Make it the default
-	logging.SetDefault(logger)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/users", func(w http.ResponseWriter, r *http.Request) {
+		// Возвращённый контекст нужно использовать, иначе атрибуты потеряются.
+		ctx := logging.ContextWithAttrs(r.Context(), logging.StringAttr("user_id", r.URL.Query().Get("id")))
 
-	// Example handler
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		ctx := r.Context()
-
-		// Context-aware logging with attributes
-		logging.ContextWithAttrs(ctx,
-			logging.StringAttr("user_id", "12345"),
-			logging.ErrAttr(nil),
-		)
-
-		logging.L(ctx).Info("health check successful")
+		logging.L(ctx).Info("loading user") // содержит request_id, method, endpoint, user_id...
 		w.WriteHeader(http.StatusOK)
 	})
 
-	// Wrap with powerful middleware
-	http.ListenAndServe(":8080", logging.Middleware(http.DefaultServeMux))
+	handler := logging.NewMiddleware(logging.WithMiddlewareLogger(logger))(mux)
+	_ = http.ListenAndServe(":8080", handler)
 }
 ```
 
----
+## Настройка логгера
 
-## ⚙️ Configuration
-### `NewLogger` Options
+| Опция | По умолчанию | Описание |
+|---|---|---|
+| `WithLevel("debug")` | env / info | Уровень; приоритетнее переменных окружения. Невалидное значение выводится в stderr и игнорируется. |
+| `WithLevelVar(lv)` | — | `*slog.LevelVar` для смены уровня на лету через `lv.Set(...)`. |
+| `WithDevMode(true)` | `false` | Текстовый вывод, уровень debug, file:line (если не заданы явно). |
+| `WithIsJSON(bool)` | `true` | JSON или текстовый вывод. |
+| `WithAddSource(bool)` | `false` | Добавлять `file:line`. Дорого на горячих путях. |
+| `WithSetDefault(bool)` | `true` | Вызвать `slog.SetDefault`. |
+| `WithWriter(w)` | `os.Stdout` | Куда писать. |
+| `WithReplaceAttr(fn)` | — | Хук `ReplaceAttr` из slog, например для маскирования секретов. |
+| `WithHandler(h)` | — | Свой `slog.Handler` (опции вывода и формата игнорируются). |
 
+**Приоритет уровня:** `WithLevel` → `LOG_LEVEL` / `SLOG_LEVEL` → debug в dev-режиме → info.
+Допустимые значения: `debug`, `info`, `warn`/`warning`, `error` (без учёта регистра).
 
-| Option                                                      | Type       | Default   | Description                                                                  |
-|:------------------------------------------------------------|:-----------|:----------|:-----------------------------------------------------------------------------|
-| `WithLevel(level)`                                          | string     | from env  | "Log level (debug, info, warn, error)"                                       |
-| `WithDevMode(true)`                                         | bool       | false     | Text output + debug level + source (ideal for local)                         |
-| `WithIsJSON(true)`                                          | bool       | true      | JSON vs human-readable text                                                  |
-| `WithAddSource(true)`                                       | bool       | true      | Include file:line in logs                                                    |
-| `WithSetDefault(true)`                                      | bool       | true      | Call slog.SetDefault                                                         |
-| `WithWriter(w)`                                             | io.Writer  | os.Stdout | Custom output destination                                                    |
-
-### Environment Variables
-
-`LOG_LEVEL` or `SLOG_LEVEL` – overrides default level (e.g. `debug`, `info`)
-
----
-
-## 📝 Core API
-### Logger Retrieval
+### Смена уровня на лету
 
 ```go
-l := logging.L(ctx)           // context-aware logger
-l = logging.Default()         // global default logger
+lv := new(slog.LevelVar)
+logger := logging.NewLogger(logging.WithLevelVar(lv))
+
+lv.Set(logging.LevelDebug) // например, из админ-эндпоинта или при перечитывании конфига
 ```
 
-### Context Helpers
-```go
-// Add attributes and return new logger
-l := logging.WithAttrs(ctx, logging.StringAttr("key", "value"))
+### Маскирование секретов
 
-// Most convenient: add attrs + update context in one call
-ctx = logging.ContextWithAttrs(ctx,
-    logging.StringAttr("user_id", "123"),
-    logging.ErrAttr(err),
+```go
+logger := logging.NewLogger(logging.WithReplaceAttr(func(_ []string, a logging.Attr) logging.Attr {
+	switch a.Key {
+	case "password", "token", "authorization":
+		return logging.StringAttr(a.Key, "***")
+	}
+	return a
+}))
+```
+
+## Работа с контекстом
+
+```go
+l := logging.L(ctx)                                  // логгер из ctx или slog default
+ctx = logging.ContextWithLogger(ctx, l)              // положить логгер в ctx
+ctx = logging.ContextWithAttrs(ctx, attrs...)        // обогатить логгер в ctx (используйте результат!)
+l = logging.WithAttrs(ctx, attrs...)                 // обогащённый логгер без изменения ctx
+id := logging.RequestIDFromContext(ctx)              // request ID из middleware/интерцепторов
+```
+
+Хелперы атрибутов: `StringAttr`, `BoolAttr`, `IntAttr`, `Int32Attr`, `Int64Attr`,
+`Uint64Attr`, `UInt32Attr`, `Float32Attr`, `Float64Attr`, `DurationAttr`,
+`TimeAttr`, `AnyAttr`, `ErrAttr`, `Group`, `GroupValue`.
+
+## HTTP middleware
+
+```go
+handler := logging.NewMiddleware(
+	logging.WithMiddlewareLogger(logger),
+	logging.WithSampling(100),                    // логировать 1 из 100 успешных запросов
+	logging.WithSlowThreshold(500*time.Millisecond),
+	logging.WithSkipPaths("/healthz", "/metrics"),
+)(mux)
+```
+
+`logging.Middleware(next)` — то же самое с опциями по умолчанию.
+
+Что делает middleware:
+- читает `X-Request-ID` (с проверкой: до 128 символов, `[A-Za-z0-9-_.:/+=]`) или
+  генерирует новый, кладёт его в контекст и в заголовок ответа;
+- кладёт в контекст логгер запроса с полями `request_id`, `method`, `endpoint`
+  (только путь), `remote_addr`, а также `trace_id` / `span_id`, если есть
+  спан OpenTelemetry;
+- пишет **одну запись на завершённый запрос** с `status`, `duration`, `bytes`:
+  Error для 5xx и паник, Warn для 4xx и медленных запросов, Info для остальных;
+- сохраняет `http.Flusher`, `http.Hijacker`, `io.ReaderFrom` и `Unwrap()`, поэтому
+  SSE, WebSocket, `http.ResponseController` и sendfile продолжают работать;
+- логирует паники со стектрейсом и пробрасывает их дальше (или отвечает 500
+  при `WithRecoverPanics(true)`).
+
+| Опция | По умолчанию | Описание |
+|---|---|---|
+| `WithMiddlewareLogger(l)` | логгер из ctx / slog default | Базовый логгер. |
+| `WithSampling(n)` | `1` | Логировать каждый n-й успешный запрос; ошибки, паники и медленные запросы логируются всегда. |
+| `WithSlowThreshold(d)` | выкл. | Медленные запросы — на уровне Warn с `"slow": true`. |
+| `WithSkipPaths(p...)` | — | Без итоговой записи для этих путей (контекст всё равно обогащается). |
+| `WithLogQuery(bool)` | `false` | Включать query string в `endpoint`. |
+| `WithRecoverPanics(bool)` | `false` | Перехватывать паники и отвечать 500 вместо проброса. |
+| `WithRequestIDHeader(h)` | `X-Request-ID` | Имя заголовка (для gRPC — ключ metadata). |
+| `WithTrustRequestID(bool)` | `true` | Использовать входящий ID или всегда генерировать новый. |
+| `WithMaxRequestIDLength(n)` | `128` | Максимальная длина входящего ID. |
+| `WithLogCompletion(bool)` | `true` | Отключить итоговые записи, оставив обогащение контекста. |
+
+Ставьте middleware **после** `otelhttp`, чтобы были доступны trace ID:
+
+```go
+handler := otelhttp.NewHandler(logging.NewMiddleware()(mux), "server")
+```
+
+Пример записи:
+
+```json
+{"time":"2026-09-24T10:00:00Z","level":"INFO","msg":"request completed","request_id":"9f86d081884c7d65","method":"GET","endpoint":"/users","remote_addr":"10.0.0.7:51234","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"00f067aa0ba902b7","status":200,"duration":1843200,"bytes":512}
+```
+
+## gRPC
+
+```go
+srv := grpc.NewServer(
+	grpc.StatsHandler(otelgrpc.NewServerHandler()),
+	grpc.ChainUnaryInterceptor(logging.UnaryServerInterceptor(logging.WithMiddlewareLogger(logger))),
+	grpc.ChainStreamInterceptor(logging.StreamServerInterceptor(logging.WithMiddlewareLogger(logger))),
 )
 ```
 
-### Attribute Helpers (from `alias.go`)
+Интерцепторы принимают те же опции, что и HTTP-middleware
+(`WithSkipPaths` принимает полные имена методов, например `/grpc.health.v1.Health/Check`).
+Каждый вызов даёт запись `rpc completed` с полями `grpc_method`, `grpc_code` и `duration`.
+Серверные коды (`Internal`, `Unknown`, `DataLoss`, `Unavailable`,
+`DeadlineExceeded`, `Unimplemented`) логируются как Error, остальные не-OK коды — как Warn.
 
-```go
-logging.StringAttr, BoolAttr, IntAttr, Int64Attr, Uint64Attr,
-Float64Attr, Float32Attr, DurationAttr, TimeAttr, AnyAttr,
-ErrAttr(err), Group, GroupValue...
-```
+`WithTraceIDInLogger()` устарел: он только обогащает логгер в контексте.
 
----
+## Высоконагруженные сервисы
 
-## 🌐 HTTP Middleware
+- **Не включайте `AddSource`** в проде (выключен по умолчанию).
+- **Буферизуйте вывод.** Небуферизованный stdout — это один системный вызов на
+  каждую запись под мьютексом хендлера:
 
-`logging.Middleware` — главная звезда этой библиотеки.
-**Что она делает автоматически:**
+  ```go
+  w := logging.NewBufferedWriter(os.Stdout, 256<<10, time.Second)
+  defer w.Close() // дописывает оставшиеся записи; вызывайте при graceful shutdown
 
-- Генерирует или считывает `X-Request-ID`
-- Добавляет его в заголовок ответа
-- Обогащает логгер следующими данными: `request_id`, `method`, `endpoint`, `remote_addr`, `trace_id`, `span_id`
-- Логирует контекст входящего запроса
-- Фиксирует статус, длительность и размер ответа
-- Логирует завершенный запрос, используя «умный» уровень логирования
+  logger := logging.NewLogger(logging.WithWriter(w))
+  ```
 
-**Usage:**
-```go
-mux := http.NewServeMux()
-// ... register handlers
-http.ListenAndServe(":8080", logging.Middleware(mux))
-```
+  Записи, оставшиеся в буфере, теряются при падении процесса.
+- **Сэмплируйте успешные запросы** через `WithSampling(n)` и исключайте health-check'и через `WithSkipPaths`.
+- **Используйте `WithLevelVar`**, чтобы временно включить debug без рестарта.
+- На горячих путях предпочитайте `logger.LogAttrs(ctx, level, msg, attrs...)`: он не упаковывает аргументы в `[]any`.
 
-**Example log output (DevMode):**
-
-```text
-INFO  2025-04-05T12:34:56.123Z method=GET endpoint=/api/users request_id=7f8e9d... remote_addr=127.0.0.1 trace_id=... span_id=...
-INFO  2025-04-05T12:34:56.189Z request completed request_id=7f8e9d... status=200 duration=66ms bytes=1243
-```
-
----
-
-## 🔌 gRPC Support
-```go
-import "google.golang.org/grpc"
-
-server := grpc.NewServer(
-    grpc.UnaryInterceptor(logging.WithTraceIDInLogger()),
-)
-```
-
-Интерцептор автоматически добавляет `method`, `trace_id` и `span_id` в логгер для каждого RPC-вызова.
-
----
-
-## 🧪 Testing
-Библиотека включает исчерпывающие тесты:
+## Разработка
 
 ```bash
-go test ./... -v
+make tidy   # go mod tidy
+make test   # тесты с race detector
+make bench  # бенчмарки
+make lint   # golangci-lint
 ```
 
-См. `logger_test.go` для примеров тестирования как `NewLogger`, так и `Middleware`.
+## Лицензия
 
----
-
-## 🛠️ Best Practices
-
-1. **Всегда используйте контекстно-зависимое логирование** — `logging.L(ctx)` или `ContextWithAttrs`.
-2. **Используйте** `ContextWithAttrs` в самом начале ваших обработчиков или промежуточного ПО (middleware).
-3. **Включайте** `WithDevMode(true)` в средах разработки или локальных средах.
-4. **Оставляйте** `WithAddSource(true)` включенным в продакшене (это очень полезно для отладки).
-5. **Используйте структурированные атрибуты** вместо `fmt.Sprintf`.
-6. **Доверьте обработку ID запросов и трассировку промежуточному ПО** — не делайте это вручную.
-
----
-
-## 🤝 Contributing
-Мы приветствуем ваш вклад! Смело открывайте Issues или Pull Requests для:
-
-- Дополнительных функций промежуточного ПО (middleware)
-- Сэмплирования логов
-- Логирования тел запросов и ответов (с ограничением по размеру)
-- Улучшения цветового оформления вывода
-- Добавления новых примеров
-
----
-
-## 📄 License
-[MIT License](https://github.com/jwm1rr0rb10/go-logging/blob/main/LICENSE) – © Raman Zaitsau [@jwm1rrr0rb10](https://github.com/jwm1rr0rb10)
-
-Сделано с ❤️ для Go-команд, которые хотят чистые, наблюдаемые и приятные логи.
+См. [LICENSE](LICENSE).

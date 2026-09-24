@@ -1,132 +1,204 @@
 package logging
 
 import (
-	"context"
-	"crypto/rand"
-	"encoding/hex"
+	"bufio"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"runtime/debug"
 	"time"
 
 	"go.opentelemetry.io/otel/trace"
-	"google.golang.org/grpc"
-
-	tracing "github.com/jwm1rr0rb10/go-tracing"
 )
 
-const (
-	requestIDLogKey = "request_id"
-	traceIDLogKey   = "trace_id"
-	spanIDLogKey    = "span_id"
-)
-
-// responseRecorder wraps http.ResponseWriter to capture status code and written bytes.
-type responseRecorder struct {
-	http.ResponseWriter
-	status  int
-	written int
+// Middleware is the HTTP logging middleware with default options.
+// See NewMiddleware for configuration.
+func Middleware(next http.Handler) http.Handler {
+	return NewMiddleware()(next)
 }
 
-func (r *responseRecorder) WriteHeader(statusCode int) {
-	r.status = statusCode
-	r.ResponseWriter.WriteHeader(statusCode)
+// NewMiddleware returns an HTTP middleware that:
+//   - reads or generates a request ID and returns it in the response header;
+//   - puts a request-scoped logger (request_id, method, endpoint,
+//     remote_addr, trace_id, span_id) and the request ID into the context;
+//   - logs one record per completed request with status, duration and bytes
+//     (Error for 5xx and panics, Warn for 4xx and slow requests, Info otherwise).
+//
+// Place it after the OpenTelemetry middleware (otelhttp) so that trace IDs
+// are available.
+func NewMiddleware(opts ...MiddlewareOption) func(http.Handler) http.Handler {
+	cfg := newMiddlewareConfig(opts)
+
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			ctx := r.Context()
+
+			reqID := cfg.requestID(r.Header.Get(cfg.requestIDHeader))
+
+			endpoint := r.URL.Path
+			if cfg.logQuery && r.URL.RawQuery != "" {
+				endpoint += "?" + r.URL.RawQuery
+			}
+
+			attrs := make([]any, 0, 6)
+			attrs = append(attrs,
+				slog.String(requestIDLogKey, reqID),
+				slog.String("method", r.Method),
+				slog.String("endpoint", endpoint),
+				slog.String("remote_addr", r.RemoteAddr),
+			)
+			attrs = appendTraceAttrs(attrs, trace.SpanContextFromContext(ctx))
+			logger := cfg.baseLogger(L(ctx)).With(attrs...)
+
+			ctx = ContextWithLogger(ctx, logger)
+			ctx = ContextWithRequestID(ctx, reqID)
+			w.Header().Set(cfg.requestIDHeader, reqID)
+
+			rec := &responseRecorder{ResponseWriter: w, status: http.StatusOK}
+			logDone := cfg.logCompletion && !cfg.skipped(r.URL.Path)
+
+			defer func() {
+				p := recover()
+				if p == nil {
+					if logDone {
+						logHTTPCompletion(r, logger, cfg, rec, time.Since(start), nil)
+					}
+					return
+				}
+				if p == http.ErrAbortHandler {
+					// Deliberate abort, not a bug: pass through without a stack.
+					panic(p)
+				}
+				if !rec.wroteHeader {
+					rec.status = http.StatusInternalServerError
+				}
+				logHTTPCompletion(r, logger, cfg, rec, time.Since(start), p)
+				if !cfg.recoverPanics {
+					panic(p)
+				}
+				if !rec.wroteHeader {
+					http.Error(rec, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				}
+			}()
+
+			next.ServeHTTP(rec, r.WithContext(ctx))
+		})
+	}
+}
+
+func logHTTPCompletion(r *http.Request, logger *slog.Logger, cfg *middlewareConfig,
+	rec *responseRecorder, duration time.Duration, panicVal any,
+) {
+	slow := cfg.slowThreshold > 0 && duration >= cfg.slowThreshold
+
+	var level slog.Level
+	switch {
+	case panicVal != nil || rec.status >= 500:
+		level = slog.LevelError
+	case rec.status >= 400 || slow:
+		level = slog.LevelWarn
+	default:
+		if !cfg.sampled() {
+			return
+		}
+		level = slog.LevelInfo
+	}
+
+	ctx := r.Context()
+	if !logger.Enabled(ctx, level) {
+		return
+	}
+
+	attrs := make([]slog.Attr, 0, 6)
+	attrs = append(attrs,
+		slog.Int("status", rec.status),
+		slog.Duration("duration", duration),
+		slog.Int64("bytes", rec.written),
+	)
+	if slow {
+		attrs = append(attrs, slog.Bool("slow", true))
+	}
+	if panicVal != nil {
+		attrs = append(attrs,
+			slog.String("panic", fmt.Sprint(panicVal)),
+			slog.String("stack", string(debug.Stack())),
+		)
+	}
+	logger.LogAttrs(ctx, level, "request completed", attrs...)
+}
+
+// responseRecorder captures the status code and response size while keeping
+// optional interfaces (Flusher, Hijacker, ReaderFrom) and Unwrap working, so
+// streaming, SSE, WebSockets and http.ResponseController are not broken.
+type responseRecorder struct {
+	http.ResponseWriter
+	status      int
+	written     int64
+	wroteHeader bool
+}
+
+func (r *responseRecorder) WriteHeader(code int) {
+	if r.wroteHeader {
+		return // superfluous call; net/http would ignore it too
+	}
+	if code >= 100 && code < 200 && code != http.StatusSwitchingProtocols {
+		// Informational responses (e.g. 103 Early Hints) are not final.
+		r.ResponseWriter.WriteHeader(code)
+		return
+	}
+	r.status = code
+	r.wroteHeader = true
+	r.ResponseWriter.WriteHeader(code)
 }
 
 func (r *responseRecorder) Write(b []byte) (int, error) {
+	if !r.wroteHeader {
+		r.wroteHeader = true // implicit 200
+	}
 	n, err := r.ResponseWriter.Write(b)
+	r.written += int64(n)
+	return n, err
+}
+
+// ReadFrom keeps the sendfile/splice fast path of http.ServeContent.
+func (r *responseRecorder) ReadFrom(src io.Reader) (int64, error) {
+	if !r.wroteHeader {
+		r.wroteHeader = true
+	}
+	var n int64
+	var err error
+	if rf, ok := r.ResponseWriter.(io.ReaderFrom); ok {
+		n, err = rf.ReadFrom(src)
+	} else {
+		n, err = io.Copy(struct{ io.Writer }{r.ResponseWriter}, src)
+	}
 	r.written += n
 	return n, err
 }
 
-// generateRequestID creates a secure random ID when none is provided.
-func generateRequestID() string {
-	b := make([]byte, 8)
-	if _, err := rand.Read(b); err != nil {
-		return fmt.Sprintf("%d", time.Now().UnixNano())
+// Flush implements http.Flusher. It is a no-op if the underlying writer
+// cannot flush.
+func (r *responseRecorder) Flush() {
+	if !r.wroteHeader {
+		r.wroteHeader = true
 	}
-	return hex.EncodeToString(b)
+	_ = http.NewResponseController(r.ResponseWriter).Flush()
 }
 
-func Middleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		ctx := r.Context()
-
-		// Automatic X-Request-ID handling
-		reqID := r.Header.Get("X-Request-ID")
-		if reqID == "" {
-			reqID = generateRequestID()
-		}
-
-		mLogger := L(ctx).With(
-			slog.String(requestIDLogKey, reqID),
-			slog.String("method", r.Method),
-			slog.String("endpoint", r.URL.RequestURI()),
-			slog.String("remote_addr", r.RemoteAddr),
-		)
-
-		// Add trace/span if present
-		if span := trace.SpanContextFromContext(ctx); span.IsValid() {
-			traceID := span.TraceID().String()
-			spanID := span.SpanID().String()
-			mLogger = mLogger.With(
-				slog.String(traceIDLogKey, traceID),
-				slog.String(spanIDLogKey, spanID),
-			)
-			tracing.TraceValue(ctx, traceIDLogKey, traceID)
-		}
-
-		// Update context and response writer
-		ctx = ContextWithLogger(ctx, mLogger)
-		rec := &responseRecorder{ResponseWriter: w, status: http.StatusOK}
-		w.Header().Set("X-Request-ID", reqID) // propagate ID to client
-
-		// Call next handler
-		next.ServeHTTP(rec, r.WithContext(ctx))
-
-		// Response logging.
-		duration := time.Since(start)
-		logAttrs := []any{
-			slog.String(requestIDLogKey, reqID),
-			slog.Int("status", rec.status),
-			slog.Duration("duration", duration),
-			slog.Int("bytes", rec.written),
-		}
-
-		// Choose log level based on status.
-		switch {
-		case rec.status >= 500:
-			mLogger.Error("request completed", logAttrs...)
-		case rec.status >= 400:
-			mLogger.Warn("request completed", logAttrs...)
-		default:
-			mLogger.Info("request completed", logAttrs...)
-		}
-	})
+// Hijack implements http.Hijacker (needed for WebSockets).
+func (r *responseRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	conn, rw, err := http.NewResponseController(r.ResponseWriter).Hijack()
+	if err == nil && !r.wroteHeader {
+		r.status = http.StatusSwitchingProtocols
+		r.wroteHeader = true
+	}
+	return conn, rw, err
 }
 
-// WithTraceIDInLogger (gRPC unchanged but kept consistent)
-func WithTraceIDInLogger() grpc.UnaryServerInterceptor {
-	return func(
-		ctx context.Context,
-		req interface{},
-		info *grpc.UnaryServerInfo,
-		handler grpc.UnaryHandler,
-	) (resp interface{}, err error) {
-		mLogger := L(ctx).With(slog.String("method", info.FullMethod))
-
-		if span := trace.SpanContextFromContext(ctx); span.IsValid() {
-			traceID := span.TraceID().String()
-			spanID := span.SpanID().String()
-			mLogger = mLogger.With(
-				slog.String(traceIDLogKey, traceID),
-				slog.String(spanIDLogKey, spanID),
-			)
-			tracing.TraceValue(ctx, traceIDLogKey, traceID)
-		}
-
-		ctx = ContextWithLogger(ctx, mLogger)
-		return handler(ctx, req)
-	}
+// Unwrap lets http.ResponseController reach the underlying writer.
+func (r *responseRecorder) Unwrap() http.ResponseWriter {
+	return r.ResponseWriter
 }
