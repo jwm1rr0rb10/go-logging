@@ -2,7 +2,11 @@
 
 Тонкая обёртка над стандартным `log/slog` с поддержкой контекста, HTTP-middleware
 и gRPC-интерцепторами: request ID, корреляция с трейсами, итоговая запись по
-каждому запросу, сэмплирование и логирование паник.
+каждому запросу, сэмплирование и логирование паник. Рассчитана на
+высоконагруженные сервисы: неблокирующий асинхронный writer с политикой
+сброса, ограничение «штормов» логов, ленивое построение логгера запроса
+(6 аллокаций на запрос, который ничего не логирует) и проброс request ID
+в исходящие HTTP- и gRPC-вызовы.
 
 Все типы — алиасы типов `log/slog`, поэтому `*logging.Logger` — это `*slog.Logger`,
 и он работает со всей экосистемой slog.
@@ -13,7 +17,7 @@
 go get github.com/jwm1rr0rb10/go-logging
 ```
 
-Нужен Go 1.21+ (точный минимум определяется зависимостями gRPC и OpenTelemetry).
+Нужен Go 1.25+ (см. `go.mod`).
 
 ## Быстрый старт
 
@@ -56,6 +60,7 @@ func main() {
 | `WithWriter(w)` | `os.Stdout` | Куда писать. |
 | `WithReplaceAttr(fn)` | — | Хук `ReplaceAttr` из slog, например для маскирования секретов. |
 | `WithHandler(h)` | — | Свой `slog.Handler` (опции вывода и формата игнорируются). |
+| `WithRateLimit(cfg)` | — | Ограничение числа записей на пару (уровень, сообщение) за интервал, см. [Штормы логов](#штормы-логов). |
 
 **Приоритет уровня:** `WithLevel` → `LOG_LEVEL` / `SLOG_LEVEL` → debug в dev-режиме → info.
 Допустимые значения: `debug`, `info`, `warn`/`warning`, `error` (без учёта регистра).
@@ -91,6 +96,12 @@ l = logging.WithAttrs(ctx, attrs...)                 // обогащённый �
 id := logging.RequestIDFromContext(ctx)              // request ID из middleware/интерцепторов
 ```
 
+Логгеры в контексте строятся **лениво**. `ContextWithAttrs` и middleware только
+запоминают атрибуты. Сам `*slog.Logger` (а это клонирование хендлера и
+пред-сериализация атрибутов) создаётся при первом вызове `L(ctx)` и
+кешируется. Запросы, которые ничего не логируют, за это не платят. `L(ctx)`
+безопасен для конкурентного использования.
+
 Хелперы атрибутов: `StringAttr`, `BoolAttr`, `IntAttr`, `Int32Attr`, `Int64Attr`,
 `Uint64Attr`, `UInt32Attr`, `Float32Attr`, `Float64Attr`, `DurationAttr`,
 `TimeAttr`, `AnyAttr`, `ErrAttr`, `Group`, `GroupValue`.
@@ -114,6 +125,9 @@ handler := logging.NewMiddleware(
 - кладёт в контекст логгер запроса с полями `request_id`, `method`, `endpoint`
   (только путь), `remote_addr`, а также `trace_id` / `span_id`, если есть
   спан OpenTelemetry;
+- делает всё это лениво: если запрос ничего не логирует (например, отсеян
+  сэмплированием), логгер не создаётся, а итоговая запись передаёт атрибуты
+  запроса вместе с записью, без клонирования хендлера;
 - пишет **одну запись на завершённый запрос** с `status`, `duration`, `bytes`:
   Error для 5xx и паник, Warn для 4xx и медленных запросов, Info для остальных;
 - сохраняет `http.Flusher`, `http.Hijacker`, `io.ReaderFrom` и `Unwrap()`, поэтому
@@ -124,7 +138,7 @@ handler := logging.NewMiddleware(
 | Опция | По умолчанию | Описание |
 |---|---|---|
 | `WithMiddlewareLogger(l)` | логгер из ctx / slog default | Базовый логгер. |
-| `WithSampling(n)` | `1` | Логировать каждый n-й успешный запрос; ошибки, паники и медленные запросы логируются всегда. |
+| `WithSampling(n)` | `1` | Логировать ровно каждый n-й успешный запрос (детерминированно); ошибки, паники и медленные запросы логируются всегда. |
 | `WithSlowThreshold(d)` | выкл. | Медленные запросы — на уровне Warn с `"slow": true`. |
 | `WithSkipPaths(p...)` | — | Без итоговой записи для этих путей (контекст всё равно обогащается). |
 | `WithLogQuery(bool)` | `false` | Включать query string в `endpoint`. |
@@ -164,30 +178,118 @@ srv := grpc.NewServer(
 
 `WithTraceIDInLogger()` устарел: он только обогащает логгер в контексте.
 
+## Проброс request ID
+
+Передавайте request ID в нижестоящие сервисы, чтобы их логи связывались с
+вашими. Уже заданный заголовок или значение metadata не перезаписывается.
+
+```go
+// HTTP-клиент
+client := &http.Client{Transport: logging.NewTransport(http.DefaultTransport)}
+req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://users/api", nil)
+resp, err := client.Do(req) // содержит X-Request-ID из ctx
+
+// gRPC-клиент
+conn, err := grpc.NewClient(addr,
+	grpc.WithChainUnaryInterceptor(logging.UnaryClientInterceptor()),
+	grpc.WithChainStreamInterceptor(logging.StreamClientInterceptor()),
+)
+```
+
+Оба принимают `WithRequestIDHeader` для своего имени заголовка или ключа metadata.
+
 ## Высоконагруженные сервисы
 
+### Асинхронный writer (рекомендуется)
+
+Небуферизованный stdout — это один системный вызов на каждую запись под
+мьютексом хендлера. Если stdout заблокировался (переполнен pipe, медленный
+log driver контейнера), блокируются все горутины, которые пишут логи, и
+растёт latency запросов. `AsyncWriter` развязывает логирование и вывод:
+
+```go
+w := logging.NewAsyncWriter(os.Stdout, 4<<20, 200*time.Millisecond)
+logger := logging.NewLogger(logging.WithWriter(w))
+
+// graceful shutdown: дописать оставшееся, но не зависнуть навсегда
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+_ = w.CloseContext(ctx)
+```
+
+- `Write` только копирует запись в память под коротким локом; фоновая
+  горутина пишет пачки вне лока. Горутины запросов никогда не ждут вывод.
+- Когда объём ожидающих данных достигает размера буфера, новые записи
+  **сбрасываются и учитываются** вместо блокировки (`ErrBufferFull`, slog его
+  игнорирует). Логи не должны тормозить или ронять сервис.
+- Буфер, заполненный на четверть, пишется сразу; иначе не реже, чем раз в
+  `flushInterval`. Память: до 2 × size.
+- Выгружайте `w.Stats()` (`Accepted`, `Dropped`, `BytesWritten`, `WriteErrors`)
+  в метрики и ставьте алерт на `Dropped`.
+- Записи, оставшиеся в буфере, теряются при падении процесса.
+
+`NewBufferedWriter(w, size, interval)` по-прежнему доступен: он никогда не
+теряет записи, но системный вызов выполняется под его локом, поэтому
+зависший вывод блокирует горутины, которые логируют.
+
+### Штормы логов
+
+Middleware всегда логирует 5xx, паники и медленные запросы. Во время
+инцидента это может означать запись на каждый запрос, и само логирование
+добавляет нагрузку. `WithRateLimit` ограничивает число записей на ключ
+(уровень, сообщение) за интервал, по аналогии с сэмплером zap:
+
+```go
+logger := logging.NewLogger(
+	logging.WithWriter(w),
+	logging.WithRateLimit(logging.RateLimitConfig{
+		Tick:       time.Second, // за интервал и на пару (уровень, сообщение):
+		First:      100,         // первые 100 записей пишутся,
+		Thereafter: 100,         // затем каждая 100-я; 0 — остальные сбрасываются
+	}),
+)
+
+dropped, _ := logging.RateLimitStats(logger) // выгружайте в метрики
+```
+
+Счётчики lock-free, без аллокаций и общие для логгеров, полученных через
+`With`/`WithGroup`. `logging.NewRateLimitHandler(h, cfg)` оборачивает любой
+`slog.Handler`; `WithRateLimit` применяется и к хендлеру из `WithHandler`.
+
+### Прочие советы
+
 - **Не включайте `AddSource`** в проде (выключен по умолчанию).
-- **Буферизуйте вывод.** Небуферизованный stdout — это один системный вызов на
-  каждую запись под мьютексом хендлера:
-
-  ```go
-  w := logging.NewBufferedWriter(os.Stdout, 256<<10, time.Second)
-  defer w.Close() // дописывает оставшиеся записи; вызывайте при graceful shutdown
-
-  logger := logging.NewLogger(logging.WithWriter(w))
-  ```
-
-  Записи, оставшиеся в буфере, теряются при падении процесса.
 - **Сэмплируйте успешные запросы** через `WithSampling(n)` и исключайте health-check'и через `WithSkipPaths`.
 - **Используйте `WithLevelVar`**, чтобы временно включить debug без рестарта.
 - На горячих путях предпочитайте `logger.LogAttrs(ctx, level, msg, attrs...)`: он не упаковывает аргументы в `[]any`.
+- Нужен ещё более быстрый энкодер? С `WithHandler` работает любой
+  `slog.Handler` (например, на базе zap или zerolog); middleware, rate limiting
+  и хелперы контекста остаются прежними.
+
+### Бенчмарки
+
+`make bench`. Go 1.26, Intel Xeon 2.1 GHz, **1 vCPU**, вывод в `io.Discard`,
+если не указано иное. v1.1.0 — предыдущая версия.
+
+| Сценарий | v1.1.0 | v1.2.0 |
+|---|---|---|
+| HTTP middleware, запрос залогирован | 2270 ns, 1448 B, 25 allocs | 1970 ns, 834 B, 7 allocs |
+| HTTP middleware, запрос не логируется (отсеян сэмплированием) | 1880 ns, 1448 B, 25 allocs | 620 ns, 754 B, 6 allocs |
+| `L(ctx).LogAttrs` с логгером из контекста | 500 ns, 0 allocs | 500 ns, 0 allocs |
+| Шторм ошибок, запись сброшена `WithRateLimit` | лимитера нет, пишется каждая запись (465 ns) | 230 ns, 0 allocs |
+| Вывод зависает на 20 ms на каждую запись, ~100k записей/с: максимальная блокировка вызова лога | 20–28 ms (`BufferedWriter`) | 0.3–2.5 ms, 0 % потерь (`AsyncWriter`) |
+
+Оставшиеся аллокации на запрос: scope запроса, значение контекста,
+`r.WithContext`, строка request ID и значение заголовка ответа. Параллельные
+бенчмарки (`*Parallel`) включены; запускайте их на многоядерной машине,
+чтобы измерить конкуренцию.
 
 ## Разработка
 
 ```bash
 make tidy   # go mod tidy
 make test   # тесты с race detector
-make bench  # бенчмарки
+make bench  # бенчмарки (middleware, контекст, writer'ы, rate limiting)
 make lint   # golangci-lint
 ```
 

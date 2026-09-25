@@ -2,6 +2,7 @@ package logging
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
@@ -36,35 +37,41 @@ func NewMiddleware(opts ...MiddlewareOption) func(http.Handler) http.Handler {
 			start := time.Now()
 			ctx := r.Context()
 
-			reqID := cfg.requestID(r.Header.Get(cfg.requestIDHeader))
+			var incoming string
+			if v := r.Header[cfg.requestIDHeader]; len(v) > 0 {
+				incoming = v[0]
+			}
+			reqID := cfg.requestID(incoming)
 
 			endpoint := r.URL.Path
 			if cfg.logQuery && r.URL.RawQuery != "" {
 				endpoint += "?" + r.URL.RawQuery
 			}
 
-			attrs := make([]any, 0, 6)
-			attrs = append(attrs,
+			// One allocation holds both the lazy logger scope and the
+			// response recorder.
+			st := &httpRequestState{rec: responseRecorder{ResponseWriter: w, status: http.StatusOK}}
+			sc := &st.scope
+			cfg.newRequestScope(ctx, sc, reqID)
+			attrs := append(sc.inline[:0],
 				slog.String(requestIDLogKey, reqID),
 				slog.String("method", r.Method),
 				slog.String("endpoint", endpoint),
 				slog.String("remote_addr", r.RemoteAddr),
 			)
-			attrs = appendTraceAttrs(attrs, trace.SpanContextFromContext(ctx))
-			logger := cfg.baseLogger(L(ctx)).With(attrs...)
+			sc.attrs = appendTraceAttrs(attrs, trace.SpanContextFromContext(ctx))
 
-			ctx = ContextWithLogger(ctx, logger)
-			ctx = ContextWithRequestID(ctx, reqID)
-			w.Header().Set(cfg.requestIDHeader, reqID)
+			ctx = withScope(ctx, sc)
+			w.Header()[cfg.requestIDHeader] = []string{reqID}
 
-			rec := &responseRecorder{ResponseWriter: w, status: http.StatusOK}
+			rec := &st.rec
 			logDone := cfg.logCompletion && !cfg.skipped(r.URL.Path)
 
 			defer func() {
 				p := recover()
 				if p == nil {
 					if logDone {
-						logHTTPCompletion(r, logger, cfg, rec, time.Since(start), nil)
+						logHTTPCompletion(ctx, sc, cfg, rec, time.Since(start), nil)
 					}
 					return
 				}
@@ -75,7 +82,7 @@ func NewMiddleware(opts ...MiddlewareOption) func(http.Handler) http.Handler {
 				if !rec.wroteHeader {
 					rec.status = http.StatusInternalServerError
 				}
-				logHTTPCompletion(r, logger, cfg, rec, time.Since(start), p)
+				logHTTPCompletion(ctx, sc, cfg, rec, time.Since(start), p)
 				if !cfg.recoverPanics {
 					panic(p)
 				}
@@ -89,7 +96,13 @@ func NewMiddleware(opts ...MiddlewareOption) func(http.Handler) http.Handler {
 	}
 }
 
-func logHTTPCompletion(r *http.Request, logger *slog.Logger, cfg *middlewareConfig,
+// httpRequestState groups per-request allocations into one.
+type httpRequestState struct {
+	scope scope
+	rec   responseRecorder
+}
+
+func logHTTPCompletion(ctx context.Context, sc *scope, cfg *middlewareConfig,
 	rec *responseRecorder, duration time.Duration, panicVal any,
 ) {
 	slow := cfg.slowThreshold > 0 && duration >= cfg.slowThreshold
@@ -107,13 +120,12 @@ func logHTTPCompletion(r *http.Request, logger *slog.Logger, cfg *middlewareConf
 		level = slog.LevelInfo
 	}
 
-	ctx := r.Context()
-	if !logger.Enabled(ctx, level) {
+	if !sc.enabled(ctx, level) {
 		return
 	}
 
-	attrs := make([]slog.Attr, 0, 6)
-	attrs = append(attrs,
+	var buf [6]slog.Attr
+	attrs := append(buf[:0],
 		slog.Int("status", rec.status),
 		slog.Duration("duration", duration),
 		slog.Int64("bytes", rec.written),
@@ -127,7 +139,7 @@ func logHTTPCompletion(r *http.Request, logger *slog.Logger, cfg *middlewareConf
 			slog.String("stack", string(debug.Stack())),
 		)
 	}
-	logger.LogAttrs(ctx, level, "request completed", attrs...)
+	sc.logAttrs(ctx, level, "request completed", attrs...)
 }
 
 // responseRecorder captures the status code and response size while keeping

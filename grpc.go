@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime/debug"
-	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel/trace"
@@ -31,11 +30,11 @@ func UnaryServerInterceptor(opts ...MiddlewareOption) grpc.UnaryServerIntercepto
 		handler grpc.UnaryHandler,
 	) (resp any, err error) {
 		start := time.Now()
-		ctx, logger := enrichGRPCContext(ctx, cfg, info.FullMethod)
+		ctx, sc := enrichGRPCContext(ctx, cfg, info.FullMethod)
 
 		defer func() {
 			if p := recover(); p != nil {
-				logGRPCCompletion(ctx, logger, cfg, info.FullMethod, codes.Internal, time.Since(start), p)
+				logGRPCCompletion(ctx, sc, cfg, codes.Internal, time.Since(start), p)
 				if !cfg.recoverPanics {
 					panic(p)
 				}
@@ -43,7 +42,7 @@ func UnaryServerInterceptor(opts ...MiddlewareOption) grpc.UnaryServerIntercepto
 				return
 			}
 			if cfg.logCompletion && !cfg.skipped(info.FullMethod) {
-				logGRPCCompletion(ctx, logger, cfg, info.FullMethod, status.Code(err), time.Since(start), nil)
+				logGRPCCompletion(ctx, sc, cfg, status.Code(err), time.Since(start), nil)
 			}
 		}()
 
@@ -62,11 +61,11 @@ func StreamServerInterceptor(opts ...MiddlewareOption) grpc.StreamServerIntercep
 		handler grpc.StreamHandler,
 	) (err error) {
 		start := time.Now()
-		ctx, logger := enrichGRPCContext(ss.Context(), cfg, info.FullMethod)
+		ctx, sc := enrichGRPCContext(ss.Context(), cfg, info.FullMethod)
 
 		defer func() {
 			if p := recover(); p != nil {
-				logGRPCCompletion(ctx, logger, cfg, info.FullMethod, codes.Internal, time.Since(start), p)
+				logGRPCCompletion(ctx, sc, cfg, codes.Internal, time.Since(start), p)
 				if !cfg.recoverPanics {
 					panic(p)
 				}
@@ -74,7 +73,7 @@ func StreamServerInterceptor(opts ...MiddlewareOption) grpc.StreamServerIntercep
 				return
 			}
 			if cfg.logCompletion && !cfg.skipped(info.FullMethod) {
-				logGRPCCompletion(ctx, logger, cfg, info.FullMethod, status.Code(err), time.Since(start), nil)
+				logGRPCCompletion(ctx, sc, cfg, status.Code(err), time.Since(start), nil)
 			}
 		}()
 
@@ -91,30 +90,27 @@ func WithTraceIDInLogger() grpc.UnaryServerInterceptor {
 	return UnaryServerInterceptor(WithLogCompletion(false))
 }
 
-func enrichGRPCContext(ctx context.Context, cfg *middlewareConfig, fullMethod string) (context.Context, *slog.Logger) {
+func enrichGRPCContext(ctx context.Context, cfg *middlewareConfig, fullMethod string) (context.Context, *scope) {
 	var incoming string
-	if md, ok := metadata.FromIncomingContext(ctx); ok {
-		if v := md.Get(strings.ToLower(cfg.requestIDHeader)); len(v) > 0 {
-			incoming = v[0]
-		}
+	// ValueFromIncomingContext does not copy the whole metadata map.
+	if v := metadata.ValueFromIncomingContext(ctx, cfg.requestIDMDKey); len(v) > 0 {
+		incoming = v[0]
 	}
 	reqID := cfg.requestID(incoming)
 
-	attrs := make([]any, 0, 4)
-	attrs = append(attrs,
+	sc := &scope{}
+	cfg.newRequestScope(ctx, sc, reqID)
+	attrs := append(sc.inline[:0],
 		slog.String(requestIDLogKey, reqID),
 		slog.String("grpc_method", fullMethod),
 	)
-	attrs = appendTraceAttrs(attrs, trace.SpanContextFromContext(ctx))
-	logger := cfg.baseLogger(L(ctx)).With(attrs...)
+	sc.attrs = appendTraceAttrs(attrs, trace.SpanContextFromContext(ctx))
 
-	ctx = ContextWithLogger(ctx, logger)
-	ctx = ContextWithRequestID(ctx, reqID)
-	return ctx, logger
+	return withScope(ctx, sc), sc
 }
 
-func logGRPCCompletion(ctx context.Context, logger *slog.Logger, cfg *middlewareConfig,
-	fullMethod string, code codes.Code, duration time.Duration, panicVal any,
+func logGRPCCompletion(ctx context.Context, sc *scope, cfg *middlewareConfig,
+	code codes.Code, duration time.Duration, panicVal any,
 ) {
 	slow := cfg.slowThreshold > 0 && duration >= cfg.slowThreshold
 
@@ -128,12 +124,12 @@ func logGRPCCompletion(ctx context.Context, logger *slog.Logger, cfg *middleware
 	if level == slog.LevelInfo && !cfg.sampled() {
 		return
 	}
-	if !logger.Enabled(ctx, level) {
+	if !sc.enabled(ctx, level) {
 		return
 	}
 
-	attrs := make([]slog.Attr, 0, 5)
-	attrs = append(attrs,
+	var buf [5]slog.Attr
+	attrs := append(buf[:0],
 		slog.String("grpc_code", code.String()),
 		slog.Duration("duration", duration),
 	)
@@ -146,7 +142,7 @@ func logGRPCCompletion(ctx context.Context, logger *slog.Logger, cfg *middleware
 			slog.String("stack", string(debug.Stack())),
 		)
 	}
-	logger.LogAttrs(ctx, level, "rpc completed", attrs...)
+	sc.logAttrs(ctx, level, "rpc completed", attrs...)
 }
 
 // grpcCodeLevel maps status codes to levels: server-side failures are

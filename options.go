@@ -1,10 +1,13 @@
 package logging
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"log/slog"
+	"net/http"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -25,7 +28,8 @@ type MiddlewareOption func(*middlewareConfig)
 
 type middlewareConfig struct {
 	logger          *slog.Logger
-	requestIDHeader string
+	requestIDHeader string // canonical HTTP header key
+	requestIDMDKey  string // lower-cased gRPC metadata key
 	trustRequestID  bool
 	maxRequestIDLen int
 	sampleEvery     uint64
@@ -51,6 +55,10 @@ func newMiddlewareConfig(opts []MiddlewareOption) *middlewareConfig {
 			opt(cfg)
 		}
 	}
+	// Canonicalize once: Header.Get/Set would otherwise allocate on every
+	// request for non-canonical names such as "X-Request-ID".
+	cfg.requestIDMDKey = strings.ToLower(cfg.requestIDHeader)
+	cfg.requestIDHeader = http.CanonicalHeaderKey(cfg.requestIDHeader)
 	return cfg
 }
 
@@ -60,8 +68,18 @@ func WithMiddlewareLogger(l *slog.Logger) MiddlewareOption {
 	return func(c *middlewareConfig) { c.logger = l }
 }
 
+// newRequestScope creates the request scope on top of the incoming context.
+func (c *middlewareConfig) newRequestScope(ctx context.Context, s *scope, reqID string) {
+	s.id = reqID
+	s.base = c.logger
+	if s.base == nil {
+		s.parent = scopeFrom(ctx)
+	}
+}
+
 // WithRequestIDHeader sets the request ID header (HTTP) or metadata key
 // (gRPC, lower-cased automatically). Default: X-Request-ID.
+// Also used by NewTransport and the gRPC client interceptors.
 func WithRequestIDHeader(name string) MiddlewareOption {
 	return func(c *middlewareConfig) {
 		if name != "" {
@@ -139,13 +157,6 @@ func WithLogCompletion(enabled bool) MiddlewareOption {
 	return func(c *middlewareConfig) { c.logCompletion = enabled }
 }
 
-func (c *middlewareConfig) baseLogger(ctxLogger *slog.Logger) *slog.Logger {
-	if c.logger != nil {
-		return c.logger
-	}
-	return ctxLogger
-}
-
 func (c *middlewareConfig) skipped(path string) bool {
 	if c.skipPaths == nil {
 		return false
@@ -155,6 +166,8 @@ func (c *middlewareConfig) skipped(path string) bool {
 }
 
 // sampled reports whether a successful, fast request should be logged.
+// The counter is deterministic (exactly every n-th request) and is touched
+// only for successful requests when sampling is enabled.
 func (c *middlewareConfig) sampled() bool {
 	if c.sampleEvery <= 1 {
 		return true
@@ -189,7 +202,7 @@ func validRequestID(id string, maxLen int) bool {
 
 var fallbackIDCounter atomic.Uint64
 
-// generateRequestID returns 16 random hex characters.
+// generateRequestID returns 16 random hex characters (one allocation).
 func generateRequestID() string {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -197,11 +210,13 @@ func generateRequestID() string {
 		return strconv.FormatInt(time.Now().UnixNano(), 36) + "-" +
 			strconv.FormatUint(fallbackIDCounter.Add(1), 36)
 	}
-	return hex.EncodeToString(b[:])
+	var h [16]byte
+	hex.Encode(h[:], b[:])
+	return string(h[:])
 }
 
 // appendTraceAttrs appends trace_id/span_id if ctx carries a valid span.
-func appendTraceAttrs(attrs []any, sc trace.SpanContext) []any {
+func appendTraceAttrs(attrs []slog.Attr, sc trace.SpanContext) []slog.Attr {
 	if !sc.IsValid() {
 		return attrs
 	}

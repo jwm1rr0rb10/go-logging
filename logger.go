@@ -38,6 +38,8 @@ type LoggerOptions struct {
 	// Handler, if set, is used as is; Writer, IsJSON, AddSource and
 	// ReplaceAttr are ignored.
 	Handler Handler
+	// RateLimit, if set, wraps the handler with NewRateLimitHandler.
+	RateLimit *RateLimitConfig
 
 	addSourceSet bool
 	isJSONSet    bool
@@ -96,6 +98,10 @@ func NewLogger(opts ...LoggerOption) *Logger {
 		} else {
 			h = slog.NewTextHandler(cfg.Writer, ho)
 		}
+	}
+
+	if cfg.RateLimit != nil {
+		h = NewRateLimitHandler(h, *cfg.RateLimit)
 	}
 
 	logger := slog.New(h)
@@ -191,7 +197,7 @@ func WithSetDefault(setDefault bool) LoggerOption {
 }
 
 // WithWriter sets the output destination. A nil writer is ignored.
-// For high-throughput services consider NewBufferedWriter.
+// For high-throughput services use NewAsyncWriter.
 func WithWriter(w io.Writer) LoggerOption {
 	return func(o *LoggerOptions) {
 		if w != nil {
@@ -209,6 +215,14 @@ func WithReplaceAttr(fn func(groups []string, a Attr) Attr) LoggerOption {
 // ReplaceAttr are ignored when a handler is provided.
 func WithHandler(h Handler) LoggerOption {
 	return func(o *LoggerOptions) { o.Handler = h }
+}
+
+// WithRateLimit limits records per (level, message) and interval to
+// protect the service from log storms; see RateLimitConfig. It also applies
+// to a handler passed with WithHandler. Read the drop counter with
+// RateLimitStats(logger).
+func WithRateLimit(cfg RateLimitConfig) LoggerOption {
+	return func(o *LoggerOptions) { o.RateLimit = &cfg }
 }
 
 // Default returns the global default logger.
