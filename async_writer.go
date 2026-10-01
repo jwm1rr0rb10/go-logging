@@ -22,10 +22,14 @@ var ErrBufferFull = errors.New("logging: async writer buffer is full, record dro
 // AsyncWriterStats is a snapshot of AsyncWriter counters. Export them to
 // your metrics system to see dropped records and output failures.
 type AsyncWriterStats struct {
-	Accepted     uint64 // records (Write calls) accepted into the buffer
-	Dropped      uint64 // records dropped because the buffer was full
-	BytesWritten uint64 // bytes successfully written to the underlying writer
-	WriteErrors  uint64 // failed writes to the underlying writer
+	Accepted uint64 // records (Write calls) accepted into the buffer
+	Dropped  uint64 // records dropped because the buffer was full
+	// DroppedPriority is the part of Dropped written through Priority
+	// (Warn and Error records of NewLogger). Alert on it: it means even the
+	// reserve was exhausted.
+	DroppedPriority uint64
+	BytesWritten    uint64 // bytes successfully written to the underlying writer
+	WriteErrors     uint64 // failed writes to the underlying writer
 }
 
 // AsyncWriter is a non-blocking, goroutine-safe io.Writer for log output.
@@ -39,6 +43,11 @@ type AsyncWriterStats struct {
 // and counted instead of blocking (see Stats). Logs must never slow down or
 // take down the service.
 //
+// The last eighth of the buffer is a reserve for records written through
+// Priority: during a burst of Info/Debug records, Warn and Error records
+// are still accepted until the buffer is completely full. NewLogger uses
+// Priority automatically when its writer is an *AsyncWriter.
+//
 // Memory: up to two buffers of the configured size (one being filled, one
 // being written).
 //
@@ -47,6 +56,7 @@ type AsyncWriterStats struct {
 type AsyncWriter struct {
 	out     io.Writer
 	size    int
+	normal  int // limit for Write; the rest is the Priority reserve
 	wakeAt  int
 	mu      sync.Mutex // guards cur, spare, closed
 	cur     []byte
@@ -60,16 +70,19 @@ type AsyncWriter struct {
 	closeOnce sync.Once
 	closeErr  error
 
-	accepted     atomic.Uint64
-	dropped      atomic.Uint64
-	bytesWritten atomic.Uint64
-	writeErrors  atomic.Uint64
+	accepted        atomic.Uint64
+	dropped         atomic.Uint64
+	droppedPriority atomic.Uint64
+	bytesWritten    atomic.Uint64
+	writeErrors     atomic.Uint64
 }
 
 // NewAsyncWriter wraps w. size is the maximum amount of pending data in
 // bytes (<= 0 uses 1 MiB); a single record larger than size is always
-// dropped. flushInterval is the maximum delay before pending data is
-// written (<= 0 uses 200ms); a quarter-full buffer is written immediately.
+// dropped. Plain Write calls may fill seven eighths of size, the rest is
+// reserved for Priority. flushInterval is the maximum delay before pending
+// data is written (<= 0 uses 200ms); a quarter-full buffer is written
+// immediately.
 func NewAsyncWriter(w io.Writer, size int, flushInterval time.Duration) *AsyncWriter {
 	if size <= 0 {
 		size = defaultAsyncBufferSize
@@ -80,6 +93,7 @@ func NewAsyncWriter(w io.Writer, size int, flushInterval time.Duration) *AsyncWr
 	a := &AsyncWriter{
 		out:    w,
 		size:   size,
+		normal: size - size/8,
 		wakeAt: size / 4,
 		cur:    make([]byte, 0, size),
 		spare:  make([]byte, 0, size),
@@ -92,16 +106,39 @@ func NewAsyncWriter(w io.Writer, size int, flushInterval time.Duration) *AsyncWr
 }
 
 // Write implements io.Writer. It never blocks on the underlying writer.
-// If the buffer is full the record is dropped and ErrBufferFull is returned.
+// If the buffer (without the Priority reserve) is full, the record is
+// dropped and ErrBufferFull is returned.
 func (a *AsyncWriter) Write(p []byte) (int, error) {
+	return a.write(p, false)
+}
+
+// Priority returns a writer into the same buffer that may also use the
+// reserve. Records keep their order relative to Write. Use it for records
+// that must survive a burst of less important ones.
+func (a *AsyncWriter) Priority() io.Writer {
+	return priorityWriter{a}
+}
+
+type priorityWriter struct{ a *AsyncWriter }
+
+func (w priorityWriter) Write(p []byte) (int, error) { return w.a.write(p, true) }
+
+func (a *AsyncWriter) write(p []byte, priority bool) (int, error) {
+	limit := a.normal
+	if priority {
+		limit = a.size
+	}
 	a.mu.Lock()
 	if a.closed {
 		a.mu.Unlock()
 		return 0, ErrWriterClosed
 	}
-	if len(a.cur)+len(p) > a.size {
+	if len(a.cur)+len(p) > limit {
 		a.mu.Unlock()
 		a.dropped.Add(1)
+		if priority {
+			a.droppedPriority.Add(1)
+		}
 		return 0, ErrBufferFull
 	}
 	a.cur = append(a.cur, p...)
@@ -148,7 +185,7 @@ func (a *AsyncWriter) drain() error {
 	if len(batch) > 0 {
 		var n int
 		n, err = a.out.Write(batch)
-		a.bytesWritten.Add(uint64(n))
+		a.bytesWritten.Add(uint64(n)) //nolint:gosec // io.Writer guarantees 0 <= n
 		if err != nil {
 			a.writeErrors.Add(1)
 		}
@@ -168,10 +205,11 @@ func (a *AsyncWriter) Flush() error {
 // Stats returns a snapshot of the counters.
 func (a *AsyncWriter) Stats() AsyncWriterStats {
 	return AsyncWriterStats{
-		Accepted:     a.accepted.Load(),
-		Dropped:      a.dropped.Load(),
-		BytesWritten: a.bytesWritten.Load(),
-		WriteErrors:  a.writeErrors.Load(),
+		Accepted:        a.accepted.Load(),
+		Dropped:         a.dropped.Load(),
+		DroppedPriority: a.droppedPriority.Load(),
+		BytesWritten:    a.bytesWritten.Load(),
+		WriteErrors:     a.writeErrors.Load(),
 	}
 }
 

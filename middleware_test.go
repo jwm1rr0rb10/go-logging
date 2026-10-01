@@ -107,7 +107,7 @@ func TestMiddlewareSamplingAndSlow(t *testing.T) {
 	for i := 0; i < 20; i++ {
 		serve(t, mw, func(http.ResponseWriter, *http.Request) {}, httptest.NewRequest(http.MethodGet, "/", nil))
 	}
-	serve(t, mw, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(500) },
+	serve(t, mw, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusInternalServerError) },
 		httptest.NewRequest(http.MethodGet, "/", nil))
 	serve(t, mw, func(http.ResponseWriter, *http.Request) { time.Sleep(25 * time.Millisecond) },
 		httptest.NewRequest(http.MethodGet, "/", nil))

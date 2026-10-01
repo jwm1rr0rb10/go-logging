@@ -144,3 +144,18 @@ func TestContextHelpers(t *testing.T) {
 		t.Fatal("ContextWithAttrs without attrs must return ctx unchanged")
 	}
 }
+
+func TestNewLoggerDoesNotSetDefaultUnlessAsked(t *testing.T) {
+	prev := Default()
+	defer SetDefault(prev)
+
+	var buf bytes.Buffer
+	l := NewLogger(WithWriter(&buf))
+	if Default() == l {
+		t.Fatal("NewLogger must not replace the slog default by default")
+	}
+	l = NewLogger(WithWriter(&buf), WithSetDefault(true))
+	if Default() != l {
+		t.Fatal("WithSetDefault(true) must replace the slog default")
+	}
+}

@@ -29,7 +29,8 @@ type LoggerOptions struct {
 	IsJSON bool
 	// SetDefault makes the logger the global slog default.
 	SetDefault bool
-	// Writer is the output destination. Defaults to os.Stdout.
+	// Writer is the output destination. Defaults to os.Stdout. With an
+	// *AsyncWriter, Warn and Error records may use its priority reserve.
 	Writer io.Writer
 	// DevMode enables text output, debug level and source locations.
 	DevMode bool
@@ -58,10 +59,9 @@ type LoggerOption func(*LoggerOptions)
 // Invalid level strings are reported to stderr and ignored.
 func NewLogger(opts ...LoggerOption) *Logger {
 	cfg := &LoggerOptions{
-		Level:      levelNotSet,
-		IsJSON:     true,
-		SetDefault: true,
-		Writer:     os.Stdout,
+		Level:  levelNotSet,
+		IsJSON: true,
+		Writer: os.Stdout,
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -93,10 +93,15 @@ func NewLogger(opts ...LoggerOption) *Logger {
 			Level:       lv,
 			ReplaceAttr: cfg.ReplaceAttr,
 		}
-		if cfg.IsJSON {
-			h = slog.NewJSONHandler(cfg.Writer, ho)
-		} else {
-			h = slog.NewTextHandler(cfg.Writer, ho)
+		newHandler := func(w io.Writer) Handler {
+			if cfg.IsJSON {
+				return slog.NewJSONHandler(w, ho)
+			}
+			return slog.NewTextHandler(w, ho)
+		}
+		h = newHandler(cfg.Writer)
+		if aw, ok := cfg.Writer.(*AsyncWriter); ok {
+			h = newPriorityHandler(h, newHandler(aw.Priority()), slog.LevelWarn)
 		}
 	}
 
@@ -191,13 +196,17 @@ func WithIsJSON(isJSON bool) LoggerOption {
 }
 
 // WithSetDefault controls whether the logger becomes the global slog
-// default (true by default).
+// default (false by default: a library must not change global state
+// implicitly). Call it in main if code that uses slog.Info and friends,
+// or L(ctx) without a context logger, should use this logger.
 func WithSetDefault(setDefault bool) LoggerOption {
 	return func(o *LoggerOptions) { o.SetDefault = setDefault }
 }
 
 // WithWriter sets the output destination. A nil writer is ignored.
-// For high-throughput services use NewAsyncWriter.
+// For high-throughput services use NewAsyncWriter: with an *AsyncWriter,
+// Warn and Error records are written through its priority reserve (see
+// AsyncWriter.Priority), so they survive bursts of lower-level records.
 func WithWriter(w io.Writer) LoggerOption {
 	return func(o *LoggerOptions) {
 		if w != nil {

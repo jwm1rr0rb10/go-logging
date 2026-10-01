@@ -1,19 +1,14 @@
 package logging
 
-import (
-	"context"
-	"net/http"
-
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/metadata"
-)
+import "net/http"
 
 // NewTransport returns an http.RoundTripper that propagates the request ID
 // from the request context (see RequestIDFromContext) to outgoing HTTP
 // requests, so logs of downstream services can be correlated. A header that
 // is already set is left untouched. base == nil uses http.DefaultTransport.
 //
-// Accepts WithRequestIDHeader; other options are ignored.
+// Accepts WithRequestIDHeader; other options are ignored. For gRPC clients
+// see the interceptors in github.com/jwm1rr0rb10/go-logging/grpc/v2.
 //
 //	client := &http.Client{Transport: logging.NewTransport(nil)}
 //	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -45,38 +40,4 @@ func (t *requestIDTransport) RoundTrip(r *http.Request) (*http.Response, error) 
 	}
 	r2.Header[t.header] = []string{id}
 	return t.base.RoundTrip(r2)
-}
-
-// UnaryClientInterceptor returns a gRPC client interceptor that propagates
-// the request ID from the context to outgoing metadata.
-// Accepts WithRequestIDHeader; other options are ignored.
-func UnaryClientInterceptor(opts ...MiddlewareOption) grpc.UnaryClientInterceptor {
-	key := newMiddlewareConfig(opts).requestIDMDKey
-	return func(ctx context.Context, method string, req, reply any,
-		cc *grpc.ClientConn, invoker grpc.UnaryInvoker, callOpts ...grpc.CallOption,
-	) error {
-		return invoker(outgoingWithRequestID(ctx, key), method, req, reply, cc, callOpts...)
-	}
-}
-
-// StreamClientInterceptor is the streaming counterpart of
-// UnaryClientInterceptor.
-func StreamClientInterceptor(opts ...MiddlewareOption) grpc.StreamClientInterceptor {
-	key := newMiddlewareConfig(opts).requestIDMDKey
-	return func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn,
-		method string, streamer grpc.Streamer, callOpts ...grpc.CallOption,
-	) (grpc.ClientStream, error) {
-		return streamer(outgoingWithRequestID(ctx, key), desc, cc, method, callOpts...)
-	}
-}
-
-func outgoingWithRequestID(ctx context.Context, key string) context.Context {
-	id := RequestIDFromContext(ctx)
-	if id == "" {
-		return ctx
-	}
-	if md, ok := metadata.FromOutgoingContext(ctx); ok && len(md.Get(key)) > 0 {
-		return ctx // set explicitly by the caller
-	}
-	return metadata.AppendToOutgoingContext(ctx, key, id)
 }

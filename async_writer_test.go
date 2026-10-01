@@ -20,6 +20,22 @@ func (b *blockingWriter) Write(p []byte) (int, error) {
 	return b.syncBuffer.Write(p)
 }
 
+// gateWriter signals entered on the first Write and blocks until release.
+type gateWriter struct {
+	entered chan struct{}
+	release chan struct{}
+	syncBuffer
+}
+
+func (g *gateWriter) Write(p []byte) (int, error) {
+	select {
+	case g.entered <- struct{}{}:
+	default:
+	}
+	<-g.release
+	return g.syncBuffer.Write(p)
+}
+
 type failingWriter struct{}
 
 func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("boom") }
@@ -157,5 +173,86 @@ func TestAsyncWriterConcurrentWithLogger(t *testing.T) {
 	}
 	if n := len(decodeLines(t, &out.buf)); n != 1600 {
 		t.Fatalf("want 1600 complete JSON lines, got %d", n)
+	}
+}
+
+func TestAsyncWriterPriorityReserve(t *testing.T) {
+	out := &gateWriter{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	w := NewAsyncWriter(out, 80, time.Hour) // Write may use 70 bytes, Priority 80
+	rec := []byte("0123456789")
+	// Quarter full: the background goroutine takes this batch and blocks in
+	// the destination, leaving an empty buffer.
+	_, _ = w.Write(rec)
+	_, _ = w.Write(rec)
+	<-out.entered
+	for i := 0; i < 7; i++ {
+		if _, err := w.Write(rec); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+	if _, err := w.Write(rec); !errors.Is(err, ErrBufferFull) {
+		t.Fatalf("plain writes must not use the reserve, got %v", err)
+	}
+	if _, err := w.Priority().Write(rec); err != nil {
+		t.Fatalf("priority write must use the reserve: %v", err)
+	}
+	if _, err := w.Priority().Write(rec); !errors.Is(err, ErrBufferFull) {
+		t.Fatalf("a full buffer must drop priority records too, got %v", err)
+	}
+	if st := w.Stats(); st.Dropped != 2 || st.DroppedPriority != 1 || st.Accepted != 10 {
+		t.Fatalf("unexpected stats: %+v", st)
+	}
+	close(out.release)
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoggerWithAsyncWriterKeepsErrorsDuringInfoBurst(t *testing.T) {
+	out := &blockingWriter{release: make(chan struct{})}
+	w := NewAsyncWriter(out, 4096, time.Hour)
+	l := NewLogger(WithWriter(w)).With("request_id", "r1").WithGroup("g")
+
+	for i := 0; i < 1000; i++ {
+		l.Info("noise", IntAttr("i", i))
+	}
+	l.Error("important", StringAttr("k", "v"))
+	if st := w.Stats(); st.Dropped == 0 || st.DroppedPriority != 0 {
+		t.Fatalf("info burst must be dropped, the error kept: %+v", st)
+	}
+
+	close(out.release)
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	lines := decodeLines(t, &out.buf)
+	last := lines[len(lines)-1]
+	g, _ := last["g"].(map[string]any)
+	if last["msg"] != "important" || last["request_id"] != "r1" || g["k"] != "v" {
+		t.Fatalf("error record must keep attrs and groups: %v", last)
+	}
+	if first := lines[0]; first["request_id"] != "r1" || first["g"] == nil {
+		t.Fatalf("info record must keep attrs and groups: %v", first)
+	}
+}
+
+func TestPriorityHandlerConcurrentMaterialization(t *testing.T) {
+	var out syncBuffer
+	w := NewAsyncWriter(&out, 1<<20, time.Hour)
+	l := NewLogger(WithWriter(w)).With("a", 1)
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			l.Error("e")
+		}()
+	}
+	wg.Wait()
+	_ = w.Close()
+	for _, rec := range decodeLines(t, &out.buf) {
+		if rec["a"] != float64(1) {
+			t.Fatalf("attr lost: %v", rec)
+		}
 	}
 }

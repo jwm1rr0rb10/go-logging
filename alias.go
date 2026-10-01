@@ -1,3 +1,11 @@
+// Package logging is a thin, context-aware wrapper around log/slog for
+// high-throughput services: HTTP middleware with request IDs, trace
+// correlation, completion records and sampling; a non-blocking async writer;
+// log storm rate limiting; and request ID propagation to downstream calls.
+//
+// Every type is an alias of the log/slog type, so a *logging.Logger is a
+// *slog.Logger. gRPC interceptors live in the separate module
+// github.com/jwm1rr0rb10/go-logging/grpc/v2.
 package logging
 
 import "log/slog"

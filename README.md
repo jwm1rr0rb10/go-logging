@@ -1,11 +1,15 @@
 # go-logging
 
+[Русская версия](READMEru.md)
+
 A thin, context-aware wrapper around Go's `log/slog` with HTTP middleware and
 gRPC interceptors: request IDs, trace correlation, completion records,
 sampling and panic logging. Built for high-throughput services: a
-non-blocking async writer with a drop policy, log-storm rate limiting,
-lazily built request loggers (6 allocations per request that does not log)
-and request ID propagation to downstream HTTP/gRPC calls.
+non-blocking async writer with a drop policy and a reserve for Warn/Error
+records, log storm rate limiting with summary records, trace-consistent
+sampling across services, lazily built request loggers (6 allocations per
+request that does not log) and request ID propagation to downstream HTTP/gRPC
+calls.
 
 Every type is an alias of the `log/slog` type, so a `*logging.Logger` is a
 `*slog.Logger` and works with the whole slog ecosystem.
@@ -13,10 +17,25 @@ Every type is an alias of the `log/slog` type, so a `*logging.Logger` is a
 ## Installation
 
 ```bash
-go get github.com/jwm1rr0rb10/go-logging
+go get github.com/jwm1rr0rb10/go-logging/v2
+
+# gRPC interceptors (a separate module, so HTTP-only services do not depend on gRPC)
+go get github.com/jwm1rr0rb10/go-logging/grpc/v2
 ```
 
-Requires Go 1.25+ (see `go.mod`).
+Requires Go 1.25+ (see `go.mod`). The only dependency of the core module is
+`go.opentelemetry.io/otel/trace`.
+
+## Migrating from v1
+
+| v1 | v2 |
+|---|---|
+| `import "github.com/jwm1rr0rb10/go-logging"` | `import logging "github.com/jwm1rr0rb10/go-logging/v2"` |
+| `NewLogger()` called `slog.SetDefault` | It does not by default. Add `logging.WithSetDefault(true)` in `main` if code that uses `slog.Info(...)` or `L(ctx)` without a context logger should use it. |
+| `logging.UnaryServerInterceptor`, `StreamServerInterceptor`, `UnaryClientInterceptor`, `StreamClientInterceptor` | Same names in `logginggrpc "github.com/jwm1rr0rb10/go-logging/grpc/v2"`; the options are still `logging.With...`. |
+| `logging.WithTraceIDInLogger()` (deprecated) | Removed: `logginggrpc.UnaryServerInterceptor(logging.WithLogCompletion(false))`. |
+| Completion record: `status`, `duration`, `bytes` | Adds `route` (the `http.ServeMux` pattern) and puts `duration` last: `route`, `status`, `bytes`, `duration`. |
+| `WithSampling(n)`: every n-th request | Requests with a trace ID are sampled by the trace ID (consistent across services); `WithTraceSampling(false)` restores the counter. |
 
 ## Quick start
 
@@ -26,16 +45,17 @@ package main
 import (
 	"net/http"
 
-	logging "github.com/jwm1rr0rb10/go-logging"
+	logging "github.com/jwm1rr0rb10/go-logging/v2"
 )
 
 func main() {
-	logger := logging.NewLogger() // JSON to stdout, level from LOG_LEVEL, becomes slog default
+	// JSON to stdout, level from LOG_LEVEL; also the slog default for code that uses slog.Info.
+	logger := logging.NewLogger(logging.WithSetDefault(true))
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/users", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /users/{id}", func(w http.ResponseWriter, r *http.Request) {
 		// The returned context must be used, otherwise the attributes are lost.
-		ctx := logging.ContextWithAttrs(r.Context(), logging.StringAttr("user_id", r.URL.Query().Get("id")))
+		ctx := logging.ContextWithAttrs(r.Context(), logging.StringAttr("user_id", r.PathValue("id")))
 
 		logging.L(ctx).Info("loading user") // carries request_id, method, endpoint, user_id...
 		w.WriteHeader(http.StatusOK)
@@ -50,19 +70,20 @@ func main() {
 
 | Option | Default | Description |
 |---|---|---|
-| `WithLevel("debug")` | env / info | Level; wins over environment variables. Invalid values are reported and ignored. |
+| `WithLevel("debug")` | env / info | Level; wins over environment variables. An invalid value is reported to stderr and ignored. |
 | `WithLevelVar(lv)` | — | Use a `*slog.LevelVar` to change the level at runtime with `lv.Set(...)`. |
 | `WithDevMode(true)` | `false` | Text output, debug level, source locations (unless set explicitly). |
 | `WithIsJSON(bool)` | `true` | JSON or text output. |
 | `WithAddSource(bool)` | `false` | Add `file:line`. Costly on hot paths. |
-| `WithSetDefault(bool)` | `true` | Call `slog.SetDefault`. |
-| `WithWriter(w)` | `os.Stdout` | Output destination. |
+| `WithSetDefault(bool)` | `false` | Call `slog.SetDefault`. A library must not change global state implicitly, so enable it in `main`. |
+| `WithWriter(w)` | `os.Stdout` | Output destination. With an `*AsyncWriter`, Warn/Error records use its reserve, see [Async writer](#async-writer-recommended). |
 | `WithReplaceAttr(fn)` | — | slog `ReplaceAttr` hook, e.g. to redact secrets. |
-| `WithHandler(h)` | — | Use a custom `slog.Handler` (writer/format options are ignored). |
+| `WithHandler(h)` | — | Use a custom `slog.Handler` (writer and format options are ignored). |
 | `WithRateLimit(cfg)` | — | Limit records per (level, message) and interval, see [Log storms](#log-storms). |
 
 **Level priority:** `WithLevel` → `LOG_LEVEL` / `SLOG_LEVEL` → debug in dev mode → info.
-Accepted values: `debug`, `info`, `warn`/`warning`, `error` (case-insensitive).
+Accepted values: `debug`, `info`, `warn`/`warning`, `error` (case-insensitive),
+optionally with an offset such as `info+2`.
 
 ### Changing the level at runtime
 
@@ -92,6 +113,7 @@ l := logging.L(ctx)                                  // logger from ctx or slog 
 ctx = logging.ContextWithLogger(ctx, l)              // put a logger into ctx
 ctx = logging.ContextWithAttrs(ctx, attrs...)        // enrich the ctx logger (use the result!)
 l = logging.WithAttrs(ctx, attrs...)                 // enriched logger without changing ctx
+ctx = logging.ContextWithRequestID(ctx, id)          // set the request ID (the logger is unchanged)
 id := logging.RequestIDFromContext(ctx)              // request ID set by middleware/interceptors
 ```
 
@@ -127,23 +149,28 @@ What it does:
 - does it lazily: if the request does not log (e.g. dropped by sampling), no
   logger is built, and the completion record passes the request attributes with
   the record instead of cloning the handler;
-- writes **one record per completed request** with `status`, `duration`, `bytes`:
-  Error for 5xx and panics, Warn for 4xx and slow requests, Info otherwise;
+- writes **one record per completed request** with `route`, `status`, `bytes`
+  and `duration`: Error for 5xx and panics, Warn for 4xx and slow requests,
+  Info otherwise. `route` is the `http.ServeMux` pattern (`GET /users/{id}`),
+  convenient for aggregation, unlike `endpoint` (`/users/42`); it is omitted if
+  no pattern matched or another router is used;
 - keeps `http.Flusher`, `http.Hijacker`, `io.ReaderFrom` and `Unwrap()` working,
   so SSE, WebSockets, `http.ResponseController` and sendfile are not broken;
 - logs panics with a stack trace and re-raises them (or answers 500 with
-  `WithRecoverPanics(true)`).
+  `WithRecoverPanics(true)`); `http.ErrAbortHandler` is passed through without
+  a record.
 
 | Option | Default | Description |
 |---|---|---|
 | `WithMiddlewareLogger(l)` | ctx logger / slog default | Base logger. |
-| `WithSampling(n)` | `1` | Log exactly every n-th successful request (deterministic); errors, panics and slow requests are always logged. |
+| `WithSampling(n)` | `1` | Log 1 of n successful requests; errors, panics and slow requests are always logged. |
+| `WithTraceSampling(bool)` | `true` | Sample requests with a trace ID by the trace ID (see below); otherwise exactly every n-th request. |
 | `WithSlowThreshold(d)` | off | Log slower requests at Warn with `"slow": true`. |
-| `WithSkipPaths(p...)` | — | No completion record for these paths (context is still enriched). |
-| `WithLogQuery(bool)` | `false` | Include the query string in `endpoint`. |
+| `WithSkipPaths(p...)` | — | No completion record for these paths, except for panics (the context is still enriched). |
+| `WithLogQuery(bool)` | `false` | Include the query string in `endpoint`. Off: query strings often contain tokens and personal data. |
 | `WithRecoverPanics(bool)` | `false` | Recover panics and answer 500 instead of re-raising. |
-| `WithRequestIDHeader(h)` | `X-Request-ID` | Header name (gRPC: metadata key). |
-| `WithTrustRequestID(bool)` | `true` | Reuse incoming IDs or always generate new ones. |
+| `WithRequestIDHeader(h)` | `X-Request-ID` | Header name (gRPC: metadata key, lower-cased). |
+| `WithTrustRequestID(bool)` | `true` | Reuse incoming IDs or always generate new ones. Disable it for public services without a trusted proxy. |
 | `WithMaxRequestIDLength(n)` | `128` | Max accepted incoming ID length. |
 | `WithLogCompletion(bool)` | `true` | Disable completion records, keep context enrichment. |
 
@@ -156,16 +183,49 @@ handler := otelhttp.NewHandler(logging.NewMiddleware()(mux), "server")
 Example record:
 
 ```json
-{"time":"2026-09-24T10:00:00Z","level":"INFO","msg":"request completed","request_id":"9f86d081884c7d65","method":"GET","endpoint":"/users","remote_addr":"10.0.0.7:51234","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"00f067aa0ba902b7","status":200,"duration":1843200,"bytes":512}
+{"time":"2026-10-01T10:00:00Z","level":"INFO","msg":"request completed","request_id":"9f86d081884c7d65","method":"GET","endpoint":"/users/42","remote_addr":"10.0.0.7:51234","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"00f067aa0ba902b7","route":"GET /users/{id}","status":200,"bytes":512,"duration":1843200}
+```
+
+### Sampling across services
+
+With `WithSampling(n)`, a request that carries a valid trace ID is logged if
+the low 8 bytes of the trace ID are divisible by n. The decision depends only
+on the trace ID, so all services with the same n log **the same traces**,
+and you see the whole request path, not random pieces of it. A trace logged
+by a service with n = 1000 is also logged by services with n = 100 or 10
+(any divisor of n), so choose powers of ten. Requests without a trace ID use
+a counter (exactly every n-th request).
+
+### Other transports
+
+`RequestTracker` is the transport-agnostic core of the middleware (request
+ID, lazy logger, sampling, slow requests, completion record). The gRPC
+interceptors are built on it; use it for message queues or custom protocols:
+
+```go
+var tracker = logging.NewRequestTracker(logging.WithMiddlewareLogger(logger), logging.WithSampling(100))
+
+func handle(msg *kafka.Message) {
+	ctx, req := tracker.Start(context.Background(), msg.Topic, header(msg, "x-request-id"),
+		logging.StringAttr("topic", msg.Topic))
+	err := process(ctx, msg) // logging.L(ctx) carries request_id and topic
+	level := logging.LevelInfo
+	if err != nil {
+		level = logging.LevelError
+	}
+	req.Finish(level, "message handled", nil, logging.ErrAttr(err))
+}
 ```
 
 ## gRPC
 
 ```go
+import logginggrpc "github.com/jwm1rr0rb10/go-logging/grpc/v2"
+
 srv := grpc.NewServer(
 	grpc.StatsHandler(otelgrpc.NewServerHandler()),
-	grpc.ChainUnaryInterceptor(logging.UnaryServerInterceptor(logging.WithMiddlewareLogger(logger))),
-	grpc.ChainStreamInterceptor(logging.StreamServerInterceptor(logging.WithMiddlewareLogger(logger))),
+	grpc.ChainUnaryInterceptor(logginggrpc.UnaryServerInterceptor(logging.WithMiddlewareLogger(logger))),
+	grpc.ChainStreamInterceptor(logginggrpc.StreamServerInterceptor(logging.WithMiddlewareLogger(logger))),
 )
 ```
 
@@ -175,7 +235,8 @@ Each call produces an `rpc completed` record with `grpc_method`, `grpc_code` and
 Server-side codes (`Internal`, `Unknown`, `DataLoss`, `Unavailable`,
 `DeadlineExceeded`, `Unimplemented`) are logged at Error, other non-OK codes at Warn.
 
-`WithTraceIDInLogger()` is deprecated; it only enriches the context logger.
+To only enrich the context logger without completion records, use
+`logginggrpc.UnaryServerInterceptor(logging.WithLogCompletion(false))`.
 
 ## Request ID propagation
 
@@ -190,8 +251,8 @@ resp, err := client.Do(req) // carries X-Request-ID from ctx
 
 // gRPC client
 conn, err := grpc.NewClient(addr,
-	grpc.WithChainUnaryInterceptor(logging.UnaryClientInterceptor()),
-	grpc.WithChainStreamInterceptor(logging.StreamClientInterceptor()),
+	grpc.WithChainUnaryInterceptor(logginggrpc.UnaryClientInterceptor()),
+	grpc.WithChainStreamInterceptor(logginggrpc.StreamClientInterceptor()),
 )
 ```
 
@@ -222,10 +283,16 @@ _ = w.CloseContext(ctx)
 - When pending data reaches the buffer size, new records are **dropped and
   counted** instead of blocking (`ErrBufferFull`, ignored by slog). Logs must
   never slow down or take down the service.
+- **Warn and Error records are protected.** The last eighth of the buffer is a
+  reserve that only `w.Priority()` may use, and `NewLogger` sends Warn/Error
+  records through it automatically. A burst of Info/Debug records is dropped
+  first, while errors still get through. Records keep their order. With a
+  custom handler, write important records to `w.Priority()` yourself.
 - A quarter-full buffer is written immediately; otherwise at least every
   `flushInterval`. Memory: up to 2 × size.
-- Export `w.Stats()` (`Accepted`, `Dropped`, `BytesWritten`, `WriteErrors`) to
-  your metrics and alert on `Dropped`.
+- Export `w.Stats()` (`Accepted`, `Dropped`, `DroppedPriority`, `BytesWritten`,
+  `WriteErrors`) to your metrics; alert on `Dropped` and, more urgently, on
+  `DroppedPriority` (even the reserve was exhausted).
 - Records still in the buffer are lost if the process crashes.
 
 `NewBufferedWriter(w, size, interval)` is still available: it never drops,
@@ -252,6 +319,17 @@ logger := logging.NewLogger(
 dropped, _ := logging.RateLimitStats(logger) // export to metrics
 ```
 
+Drops are visible in the logs, too: when a key that had records dropped
+appears again in a new interval, a summary record with the same level is
+written first (without the attributes of a single request):
+
+```json
+{"level":"ERROR","msg":"log records suppressed","suppressed_msg":"db timeout","suppressed":9900,"interval":1000000000}
+```
+
+The summary is written when the key reappears, so after the storm ends the
+last interval is reported only by `RateLimitStats`.
+
 The counters are lock-free, allocation-free and shared by loggers derived
 with `With`/`WithGroup`. `logging.NewRateLimitHandler(h, cfg)` wraps any
 `slog.Handler`; `WithRateLimit` also applies to a handler passed with
@@ -263,36 +341,66 @@ with `With`/`WithGroup`. `logging.NewRateLimitHandler(h, cfg)` wraps any
 - **Sample successful requests** with `WithSampling(n)` and skip health checks with `WithSkipPaths`.
 - **Use `WithLevelVar`** to enable debug temporarily without a restart.
 - Prefer `logger.LogAttrs(ctx, level, msg, attrs...)` on hot paths: it avoids boxing arguments into `[]any`.
-- Need an even faster encoder? Any `slog.Handler` works with `WithHandler`
-  (for example a zap- or zerolog-backed one); the middleware, rate limiting and
-  context helpers stay the same.
+- Need a faster encoder? `slog.JSONHandler` is the main cost (see the
+  comparison below). Any `slog.Handler` works with `WithHandler` (for example
+  a zap-backed one via `go.uber.org/zap/exp/zapslog`); the middleware, rate
+  limiting and context helpers stay the same.
 
-### Benchmarks
+## Benchmarks
 
-`make bench`. Go 1.26, Intel Xeon 2.1 GHz, **1 vCPU**, output to `io.Discard`
-unless noted. v1.1.0 is the previous version.
+Go 1.27, Intel Core Ultra 5 225H, `-cpu=1`, output to `io.Discard` unless
+noted. Run `make bench`.
 
-| Scenario | v1.1.0 | v1.2.0 |
-|---|---|---|
-| HTTP middleware, request logged | 2270 ns, 1448 B, 25 allocs | 1970 ns, 834 B, 7 allocs |
-| HTTP middleware, request not logged (sampled out) | 1880 ns, 1448 B, 25 allocs | 620 ns, 754 B, 6 allocs |
-| `L(ctx).LogAttrs` with a context logger | 500 ns, 0 allocs | 500 ns, 0 allocs |
-| Error storm, record dropped by `WithRateLimit` | no limiter, every record written (465 ns) | 230 ns, 0 allocs |
-| Destination stalls 20 ms per write, ~100k records/s: max time a log call blocks | 20–28 ms (`BufferedWriter`) | 0.3–2.5 ms, 0 % dropped (`AsyncWriter`) |
+| Scenario | Result |
+|---|---|
+| HTTP middleware, request logged | 2230 ns, 898 B, 7 allocs |
+| HTTP middleware, request not logged (sampled out) | 680 ns, 818 B, 6 allocs |
+| `L(ctx).LogAttrs` with a context logger | 640 ns, 0 allocs |
+| Error storm: record dropped by `WithRateLimit` / no limiter | 310 ns / 650 ns, 0 allocs |
+| Destination stalls 20 ms per write, ~100k records/s: max time a log call blocks | `BufferedWriter` 20.6 ms; `AsyncWriter` 0.04 ms, 0 % dropped |
 
-The remaining allocations per request are the request scope, the context
+The remaining allocations per request are the request state, the context
 value, `r.WithContext`, the request ID string and the response header value.
-Parallel benchmarks (`*Parallel`) are included; run them on a multi-core
-machine to measure contention.
+Parallel benchmarks (`*Parallel`) measure contention on multi-core machines.
+
+### Compared with zap and zerolog
+
+`make compare` (a separate module in `benchmarks/`). Same machine, ns/op on
+1 core / 8 cores, allocations per op. Single runs, so treat the numbers as
+indicative.
+
+| Scenario | go-logging (slog JSON) | zap | zerolog |
+|---|---|---|---|
+| Record with 4 fields | 771 / 173 ns, 0 allocs | 655 / 95 ns, 1 alloc | 205 / 50 ns, 0 allocs |
+| Record from a logger with 4 request fields | 663 / 191 ns, 0 allocs | 370 / 51 ns, 1 alloc | 177 / 56 ns, 0 allocs |
+| Disabled level (Debug at Info) | 43 / 5 ns, 0 allocs | 53 / 35 ns, 1 alloc | 5 / 0.6 ns, 0 allocs |
+| New request logger (4 fields) + one record | 1143 / 356 ns, 10 allocs | 769 / 642 ns, 7 allocs | 278 / 233 ns, 1 alloc |
+
+zerolog's encoder is 3–4× faster than `slog.JSONHandler`, zap is in between.
+For typical services (thousands to tens of thousands of records per second
+per instance) the difference is negligible; for higher volumes plug in a
+faster handler with `WithHandler`. The middleware's lazy logger means most
+requests never build a request logger at all.
 
 ## Development
 
 ```bash
-make tidy   # go mod tidy
-make test   # tests with the race detector
-make bench  # benchmarks (middleware, context, writers, rate limiting)
-make lint   # golangci-lint
+make tidy     # go mod tidy in all modules
+make test     # tests of the library and the gRPC module (with -race if cgo is available)
+make cover    # coverage of the library
+make bench    # benchmarks (middleware, context, writers, rate limiting)
+make compare  # comparison with zap and zerolog
+make fuzz     # fuzz tests, FUZZTIME=5m make fuzz for longer runs
+make lint     # golangci-lint (.golangci.yml)
+make tags     # tag vX.Y.Z and grpc/vX.Y.Z from ./version
 ```
+
+The repository has three modules: the library (`.`), the gRPC integration
+(`grpc/`, depends on the library through a local `replace` during
+development) and the comparison benchmarks (`benchmarks/`, not released).
+Before `make tags`, make sure `grpc/go.mod` requires the library version that
+is being released. CI (`.github/workflows/ci.yml`) runs lint, tests with
+`-race` on the minimum and latest Go, fuzzing and a benchmark smoke run.
 
 ## License
 

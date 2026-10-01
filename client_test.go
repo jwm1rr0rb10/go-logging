@@ -5,9 +5,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/metadata"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -18,7 +15,7 @@ func TestTransportPropagatesRequestID(t *testing.T) {
 	var got string
 	tr := NewTransport(roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		got = r.Header.Get("X-Request-ID")
-		return &http.Response{StatusCode: 200, Body: http.NoBody}, nil
+		return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
 	}))
 
 	ctx := ContextWithRequestID(context.Background(), "abc-123")
@@ -44,7 +41,7 @@ func TestMiddlewareToTransportEndToEnd(t *testing.T) {
 	var downstream string
 	tr := NewTransport(roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		downstream = r.Header.Get("X-Request-ID")
-		return &http.Response{StatusCode: 200, Body: http.NoBody}, nil
+		return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
 	}))
 	h := NewMiddleware(WithLogCompletion(false))(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		out, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, "http://svc", nil)
@@ -55,45 +52,5 @@ func TestMiddlewareToTransportEndToEnd(t *testing.T) {
 	h.ServeHTTP(httptest.NewRecorder(), req)
 	if downstream != "req-42" {
 		t.Fatalf("got %q", downstream)
-	}
-}
-
-func TestUnaryClientInterceptorPropagatesRequestID(t *testing.T) {
-	var got []string
-	invoker := func(ctx context.Context, _ string, _, _ any, _ *grpc.ClientConn, _ ...grpc.CallOption) error {
-		md, _ := metadata.FromOutgoingContext(ctx)
-		got = md.Get("x-request-id")
-		return nil
-	}
-	ic := UnaryClientInterceptor()
-	ctx := ContextWithRequestID(context.Background(), "abc")
-	_ = ic(ctx, "/svc/M", nil, nil, nil, invoker)
-	if len(got) != 1 || got[0] != "abc" {
-		t.Fatalf("got %v", got)
-	}
-
-	ctx = metadata.AppendToOutgoingContext(ctx, "x-request-id", "explicit")
-	_ = ic(ctx, "/svc/M", nil, nil, nil, invoker)
-	if len(got) != 1 || got[0] != "explicit" {
-		t.Fatalf("explicit metadata must win, got %v", got)
-	}
-
-	_ = ic(context.Background(), "/svc/M", nil, nil, nil, invoker)
-	if len(got) != 0 {
-		t.Fatalf("no id in ctx must not add metadata, got %v", got)
-	}
-}
-
-func TestStreamClientInterceptorPropagatesRequestID(t *testing.T) {
-	var got []string
-	streamer := func(ctx context.Context, _ *grpc.StreamDesc, _ *grpc.ClientConn, _ string, _ ...grpc.CallOption) (grpc.ClientStream, error) {
-		md, _ := metadata.FromOutgoingContext(ctx)
-		got = md.Get("x-request-id")
-		return nil, nil
-	}
-	ctx := ContextWithRequestID(context.Background(), "s-1")
-	_, _ = StreamClientInterceptor()(ctx, &grpc.StreamDesc{}, nil, "/svc/S", streamer)
-	if len(got) != 1 || got[0] != "s-1" {
-		t.Fatalf("got %v", got)
 	}
 }

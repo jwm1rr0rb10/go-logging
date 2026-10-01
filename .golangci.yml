@@ -1,0 +1,41 @@
+version: "2"
+
+linters:
+  enable:
+    - bodyclose
+    - errorlint
+    - gocritic
+    - gosec
+    - misspell
+    - nolintlint
+    - perfsprint
+    - prealloc
+    - revive
+    - sloglint
+    - unconvert
+    - unparam
+    - usestdlibvars
+  settings:
+    gosec:
+      excludes:
+        - G104 # unhandled errors are checked by errcheck
+    revive:
+      rules:
+        - name: exported
+        - name: package-comments
+        - name: var-naming
+    sloglint:
+      attr-only: true # hot paths must not box key/value pairs
+  exclusions:
+    presets:
+      - std-error-handling
+    rules:
+      - path: _test\.go
+        linters: [bodyclose, gosec, unparam, sloglint, prealloc]
+      - path: alias\.go # one comment documents each alias group
+        linters: [revive]
+        text: "comment on exported"
+
+formatters:
+  enable:
+    - gofmt

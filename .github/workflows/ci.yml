@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*", "grpc/v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        module: [".", "grpc"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -s -l .)" || (gofmt -s -d . && exit 1)
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: latest
+          working-directory: ${{ matrix.module }}
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go: ["1.25.x", "stable"] # minimum supported and latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - name: Vet
+        run: make vet
+      - name: Test (race)
+        run: make test
+      - name: Coverage
+        run: make cover
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Fuzz
+        run: make fuzz FUZZTIME=30s
+
+  bench:
+    # Smoke run: benchmarks compile and run; numbers on shared runners are noise.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test -run='^$' -bench=. -benchtime=100x ./...
+      - run: cd benchmarks && go test -run='^$' -bench=. -benchtime=100x ./...

@@ -34,8 +34,38 @@ func TestRateLimitResetsEveryTick(t *testing.T) {
 	l.Info("x") // dropped, Thereafter == 0
 	time.Sleep(30 * time.Millisecond)
 	l.Info("x")
-	if n := len(decodeLines(t, &buf)); n != 2 {
-		t.Fatalf("want 2 records, got %d", n)
+	lines := decodeLines(t, &buf)
+	if len(lines) != 3 {
+		t.Fatalf("want record, summary, record; got %d records", len(lines))
+	}
+	sum := lines[1]
+	if sum["msg"] != "log records suppressed" || sum["suppressed_msg"] != "x" ||
+		sum["suppressed"] != float64(1) || sum["level"] != "INFO" || lines[2]["msg"] != "x" {
+		t.Fatalf("unexpected summary: %v", lines)
+	}
+}
+
+func TestRateLimitSummaryHasNoRecordAttrs(t *testing.T) {
+	var buf bytes.Buffer
+	l := newTestLogger(&buf, WithRateLimit(RateLimitConfig{Tick: 20 * time.Millisecond, First: 1}))
+	req := l.With("request_id", "r1")
+	for i := 0; i < 5; i++ {
+		req.Error("boom")
+	}
+	time.Sleep(30 * time.Millisecond)
+	l.With("request_id", "r2").Error("boom")
+	lines := decodeLines(t, &buf)
+	if len(lines) != 3 {
+		t.Fatalf("want 3 records, got %v", lines)
+	}
+	if sum := lines[1]; sum["suppressed"] != float64(4) || sum["level"] != "ERROR" || sum["request_id"] != nil {
+		t.Fatalf("summary must count drops and carry no request attrs: %v", sum)
+	}
+	if lines[2]["request_id"] != "r2" {
+		t.Fatalf("the triggering record must keep its attrs: %v", lines[2])
+	}
+	if dropped, _ := RateLimitStats(l); dropped != 4 {
+		t.Fatalf("want 4 dropped, got %d", dropped)
 	}
 }
 

@@ -3,11 +3,11 @@ package logging
 import (
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"log/slog"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -29,10 +29,10 @@ type MiddlewareOption func(*middlewareConfig)
 type middlewareConfig struct {
 	logger          *slog.Logger
 	requestIDHeader string // canonical HTTP header key
-	requestIDMDKey  string // lower-cased gRPC metadata key
 	trustRequestID  bool
 	maxRequestIDLen int
 	sampleEvery     uint64
+	traceSampling   bool
 	slowThreshold   time.Duration
 	skipPaths       map[string]struct{}
 	logQuery        bool
@@ -48,6 +48,7 @@ func newMiddlewareConfig(opts []MiddlewareOption) *middlewareConfig {
 		trustRequestID:  true,
 		maxRequestIDLen: defaultMaxRequestIDLen,
 		sampleEvery:     1,
+		traceSampling:   true,
 		logCompletion:   true,
 	}
 	for _, opt := range opts {
@@ -57,7 +58,6 @@ func newMiddlewareConfig(opts []MiddlewareOption) *middlewareConfig {
 	}
 	// Canonicalize once: Header.Get/Set would otherwise allocate on every
 	// request for non-canonical names such as "X-Request-ID".
-	cfg.requestIDMDKey = strings.ToLower(cfg.requestIDHeader)
 	cfg.requestIDHeader = http.CanonicalHeaderKey(cfg.requestIDHeader)
 	return cfg
 }
@@ -105,9 +105,12 @@ func WithMaxRequestIDLength(n int) MiddlewareOption {
 	}
 }
 
-// WithSampling logs only every n-th successful request. Client errors,
+// WithSampling logs only one of every n successful requests. Client errors,
 // server errors, panics and slow requests are always logged.
 // n <= 1 logs every request (default).
+//
+// Requests with a valid trace ID are sampled by the trace ID (see
+// WithTraceSampling), others by a counter (exactly every n-th request).
 func WithSampling(n uint64) MiddlewareOption {
 	return func(c *middlewareConfig) {
 		if n < 1 {
@@ -115,6 +118,16 @@ func WithSampling(n uint64) MiddlewareOption {
 		}
 		c.sampleEvery = n
 	}
+}
+
+// WithTraceSampling controls how WithSampling picks requests that carry a
+// valid OpenTelemetry trace ID (true by default). With true the decision is
+// derived from the trace ID, so every service that uses the same n logs the
+// same traces, and a trace logged by a service with n = 1000 is also logged
+// by services with n = 100 or 10 (any divisor of n). With false a counter
+// is used for all requests.
+func WithTraceSampling(enabled bool) MiddlewareOption {
+	return func(c *middlewareConfig) { c.traceSampling = enabled }
 }
 
 // WithSlowThreshold logs requests slower than d at Warn level, bypassing
@@ -125,7 +138,8 @@ func WithSlowThreshold(d time.Duration) MiddlewareOption {
 
 // WithSkipPaths disables completion logs for the given HTTP paths or gRPC
 // full method names (e.g. "/healthz", "/grpc.health.v1.Health/Check").
-// The request-scoped logger is still put into the context.
+// The request-scoped logger is still put into the context, and panics are
+// still logged.
 func WithSkipPaths(paths ...string) MiddlewareOption {
 	return func(c *middlewareConfig) {
 		if c.skipPaths == nil {
@@ -166,11 +180,16 @@ func (c *middlewareConfig) skipped(path string) bool {
 }
 
 // sampled reports whether a successful, fast request should be logged.
-// The counter is deterministic (exactly every n-th request) and is touched
-// only for successful requests when sampling is enabled.
-func (c *middlewareConfig) sampled() bool {
+// With a valid trace ID the decision is a pure function of the ID: the low
+// 8 bytes are random in W3C trace IDs. Otherwise a deterministic counter
+// (exactly every n-th request) is used; it is touched only for successful
+// requests when sampling is enabled.
+func (c *middlewareConfig) sampled(traceID trace.TraceID) bool {
 	if c.sampleEvery <= 1 {
 		return true
+	}
+	if c.traceSampling && traceID.IsValid() {
+		return binary.BigEndian.Uint64(traceID[8:])%c.sampleEvery == 0
 	}
 	return c.counter.Add(1)%c.sampleEvery == 1
 }
