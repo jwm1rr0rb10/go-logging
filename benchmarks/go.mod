@@ -15,7 +15,7 @@ require (
 	go.opentelemetry.io/otel v1.43.0 // indirect
 	go.opentelemetry.io/otel/trace v1.43.0 // indirect
 	go.uber.org/multierr v1.10.0 // indirect
-	golang.org/x/sys v0.29.0 // indirect
+	golang.org/x/sys v0.40.0 // indirect
 )
 
 replace github.com/jwm1rr0rb10/go-logging/v2 => ../
